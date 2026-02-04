@@ -1,0 +1,11 @@
+<svg width="34" height="34" viewBox="0 0 34 34" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <circle cx="17" cy="17" r="14" fill="#2563EB" stroke="#1E3A8A" stroke-width="2" />
+    <text x="17" y="22" text-anchor="middle" font-size="16" font-weight="700" font-family="Arial, sans-serif" fill="#FFFFFF">H</text>
+  </g>
+</svg>

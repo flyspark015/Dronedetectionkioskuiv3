@@ -1,0 +1,381 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ndefender.example.com/schemas/api.json",
+  "title": "N-Defender API Schema",
+  "description": "Canonical JSON Schema for N-Defender backend/UI contract validation. Last Updated: 2026-01-26",
+  
+  "definitions": {
+    "GPSStatus": {
+      "type": "object",
+      "description": "GPS status from /api/v1/status. NAMING: latitude/longitude (NOT lat/lng)",
+      "required": ["latitude", "longitude", "alt_m", "speed_mps", "heading_deg", "fix_quality", "hdop", "sats", "timestamp"],
+      "properties": {
+        "latitude": {
+          "type": "number",
+          "description": "Latitude in decimal degrees (NOT 'lat')",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "longitude": {
+          "type": "number",
+          "description": "Longitude in decimal degrees (NOT 'lng')",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "alt_m": {
+          "type": "number",
+          "description": "Altitude in meters"
+        },
+        "speed_mps": {
+          "type": "number",
+          "description": "Speed in meters per second",
+          "minimum": 0
+        },
+        "heading_deg": {
+          "type": "number",
+          "description": "Heading in degrees (0-360)",
+          "minimum": 0,
+          "maximum": 360
+        },
+        "fix_quality": {
+          "type": "integer",
+          "description": "GPS fix quality: 0=none, 1=gps, 2=dgps",
+          "enum": [0, 1, 2]
+        },
+        "hdop": {
+          "type": "number",
+          "description": "Horizontal dilution of precision",
+          "minimum": 0
+        },
+        "sats": {
+          "type": "integer",
+          "description": "Number of satellites",
+          "minimum": 0
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Milliseconds since epoch (NOT seconds)",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    
+    "DroneCoords": {
+      "type": "object",
+      "description": "Remote ID drone coordinates. NAMING: lat/lon (NOT lng)",
+      "required": ["lat", "lon", "alt_m"],
+      "properties": {
+        "lat": {
+          "type": "number",
+          "description": "Latitude in decimal degrees (NOT 'latitude')",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "lon": {
+          "type": "number",
+          "description": "Longitude in decimal degrees (NOT 'lng')",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "alt_m": {
+          "type": "number",
+          "description": "Altitude in meters"
+        },
+        "speed_mps": {
+          "type": "number",
+          "description": "Speed in meters per second",
+          "minimum": 0
+        },
+        "heading_deg": {
+          "type": "number",
+          "description": "Heading in degrees (0-360)",
+          "minimum": 0,
+          "maximum": 360
+        },
+        "last_update_ts": {
+          "type": "integer",
+          "description": "Last update timestamp in milliseconds",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    
+    "PilotCoords": {
+      "type": "object",
+      "description": "Remote ID pilot coordinates. NAMING: lat/lon (NOT lng)",
+      "required": ["lat", "lon"],
+      "properties": {
+        "lat": {
+          "type": "number",
+          "description": "Latitude in decimal degrees",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "lon": {
+          "type": "number",
+          "description": "Longitude in decimal degrees (NOT 'lng')",
+          "minimum": -180,
+          "maximum": 180
+        }
+      },
+      "additionalProperties": false
+    },
+    
+    "RemoteIdData": {
+      "type": "object",
+      "description": "Remote ID contact data",
+      "properties": {
+        "model": { "type": "string" },
+        "serial_id": {
+          "type": "string",
+          "description": "Serial ID with underscore (NOT serialId)"
+        },
+        "operator_id": { "type": "string" },
+        "uas_id": { "type": "string" },
+        "drone_coords": { "$ref": "#/definitions/DroneCoords" },
+        "pilot_coords": { "$ref": "#/definitions/PilotCoords" },
+        "home_coords": { "$ref": "#/definitions/PilotCoords" },
+        "flight_desc": { "type": "string" },
+        "timestamp_accuracy": { "type": "number" },
+        "speed_accuracy": { "type": "number" },
+        "vert_accuracy": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    
+    "FpvLinkData": {
+      "type": "object",
+      "description": "FPV link contact data. NAMING: freq_hz (NOT freq_mhz)",
+      "required": ["freq_hz", "rssi_dbm", "lock_state"],
+      "properties": {
+        "freq_hz": {
+          "type": "integer",
+          "description": "Frequency in Hz (NOT MHz)",
+          "minimum": 0
+        },
+        "rssi_dbm": {
+          "type": "number",
+          "description": "Calibrated RSSI in dBm"
+        },
+        "lock_state": {
+          "type": "string",
+          "enum": ["scanning", "locked", "hold"]
+        },
+        "band": { "type": "string" },
+        "channel": { "type": "integer" },
+        "threshold": { "type": "string" },
+        "hit_count": { "type": "integer" },
+        "confidence": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    
+    "UnknownRfData": {
+      "type": "object",
+      "description": "Unknown RF contact data",
+      "properties": {
+        "signal_strength": { "type": "number" },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    
+    "BaseContact": {
+      "type": "object",
+      "description": "Base contact fields",
+      "required": ["id", "type", "last_seen_ts", "first_seen_ts", "source", "severity"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": ["REMOTE_ID", "FPV_LINK", "UNKNOWN_RF"],
+          "description": "Contact type (NOT 'remote-id', 'fpv', 'unknown')"
+        },
+        "last_seen_ts": {
+          "type": "integer",
+          "description": "Last seen timestamp in milliseconds (NOT seconds)",
+          "minimum": 0
+        },
+        "first_seen_ts": {
+          "type": "integer",
+          "description": "First seen timestamp in milliseconds",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string",
+          "enum": ["live", "replay"]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["critical", "high", "medium", "low", "info"]
+        },
+        "isPinned": { "type": "boolean" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    
+    "RemoteIdContact": {
+      "allOf": [
+        { "$ref": "#/definitions/BaseContact" },
+        {
+          "type": "object",
+          "required": ["remote_id"],
+          "properties": {
+            "type": { "const": "REMOTE_ID" },
+            "remote_id": { "$ref": "#/definitions/RemoteIdData" },
+            "derived": {
+              "type": "object",
+              "description": "UI-computed derived fields (GPS-gated)",
+              "properties": {
+                "distance_m": {
+                  "type": "number",
+                  "description": "Distance in meters (computed by UI)",
+                  "minimum": 0
+                },
+                "bearing_deg": {
+                  "type": "number",
+                  "description": "Bearing in degrees (computed by UI)",
+                  "minimum": 0,
+                  "maximum": 360
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    
+    "FpvLinkContact": {
+      "allOf": [
+        { "$ref": "#/definitions/BaseContact" },
+        {
+          "type": "object",
+          "required": ["fpv_link"],
+          "properties": {
+            "type": { "const": "FPV_LINK" },
+            "fpv_link": { "$ref": "#/definitions/FpvLinkData" }
+          }
+        }
+      ]
+    },
+    
+    "UnknownRfContact": {
+      "allOf": [
+        { "$ref": "#/definitions/BaseContact" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "UNKNOWN_RF" },
+            "unknown_rf": { "$ref": "#/definitions/UnknownRfData" }
+          }
+        }
+      ]
+    },
+    
+    "Contact": {
+      "oneOf": [
+        { "$ref": "#/definitions/RemoteIdContact" },
+        { "$ref": "#/definitions/FpvLinkContact" },
+        { "$ref": "#/definitions/UnknownRfContact" }
+      ]
+    },
+    
+    "StatusSnapshot": {
+      "type": "object",
+      "description": "System status from GET /api/v1/status",
+      "required": ["timestamp", "gps", "esp32", "fpv_scanner", "remote_id", "system"],
+      "properties": {
+        "timestamp": {
+          "type": "integer",
+          "description": "Status snapshot timestamp in milliseconds",
+          "minimum": 0
+        },
+        "gps": { "$ref": "#/definitions/GPSStatus" },
+        "esp32": {
+          "type": "object",
+          "required": ["state"],
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": ["connected", "disconnected"]
+            },
+            "version": { "type": "string" }
+          }
+        },
+        "fpv_scanner": {
+          "type": "object",
+          "required": ["state"],
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": ["scanning", "locked", "hold", "stopped"]
+            },
+            "band": { "type": "string" },
+            "threshold": { "type": "string" }
+          }
+        },
+        "remote_id": {
+          "type": "object",
+          "required": ["state"],
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": ["active", "inactive"]
+            }
+          }
+        },
+        "system": {
+          "type": "object",
+          "required": ["storage_free_gb", "cpu_temp_c"],
+          "properties": {
+            "storage_free_gb": {
+              "type": "number",
+              "minimum": 0
+            },
+            "cpu_temp_c": {
+              "type": "number"
+            },
+            "battery_level": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "network_status": { "type": "string" }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    
+    "WebSocketEnvelope": {
+      "type": "object",
+      "description": "WebSocket message envelope (MANDATORY structure)",
+      "required": ["type", "timestamp", "source", "data"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["TELEMETRY_UPDATE", "CONTACT_NEW", "CONTACT_UPDATE", "CONTACT_LOST", "REPLAY_STATE"],
+          "description": "Event type (NOT 'RID_CONTACT_NEW' or lowercase)"
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Event timestamp in milliseconds",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string",
+          "enum": ["live", "replay"]
+        },
+        "data": {
+          "description": "Event-specific payload"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

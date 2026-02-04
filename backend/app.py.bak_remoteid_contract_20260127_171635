@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+import json, os, time, threading, socket
+from typing import Any, Dict, Optional, Set, List, Tuple
+from collections import deque
+
+from flask import send_from_directory, Flask, jsonify
+from flask_sock import Sock
+
+APP_PORT = 8000
+STATE_DIR = "/opt/ndefender/backend/state"
+REMOTEID_STATE_FILE = os.path.join(STATE_DIR, "remoteid_state.json")
+GPS_STATE_FILE = os.path.join(STATE_DIR, "gps_state.json")
+
+RAW_JSONL_PATH = "/opt/ndefender/logs/remoteid_replay.jsonl"
+EK_JSONL_PATH  = "/opt/ndefender/logs/odid_wifi_sample.ek.jsonl"
+
+# Phase-1.1 replay-only
+RID_TTL_S = 15.0
+RID_REPLAY_LOOP = (os.environ.get("NDEFENDER_REPLAY_LOOP","0") == "1")  # 1=loop, 0=one-shot
+RID_REPLAY_SLEEP_S = 0.01
+RID_STATS_PERIOD_S = 1.0
+
+app = Flask(__name__, static_folder='/opt/ndefender/backend/static/ui', static_url_path='')
+
+
+# ---- UI STATIC SERVE (SPA) ----
+# Serves built UI from /opt/ndefender/backend/static/ui
+# Keeps API at /api/v1/* untouched.
+@app.get("/")
+def ui_index():
+    return send_from_directory(app.static_folder, "index.html")
+
+@app.get("/<path:path>")
+def ui_assets(path):
+    # If asset exists, serve it; otherwise SPA fallback to index.html
+    full = Path(app.static_folder) / path
+    if full.exists() and full.is_file():
+        return send_from_directory(app.static_folder, path)
+    return send_from_directory(app.static_folder, "index.html")
+# ---- END UI STATIC SERVE ----
+
+sock = Sock(app)
+
+_ws_clients_lock = threading.Lock()
+_ws_clients: Set[Any] = set()
+_stop = threading.Event()
+
+# Global tracker ref for WS snapshots
+_TRACKER = None
+
+# Replay runtime state (for /api/v1/status)
+REPLAY_STATE = {"active": False, "last_change_ts": time.time()}
+
+def now_ts() -> int:
+    return int(time.time() * 1000)
+def atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
+    tmp = f"{path}.tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, path)
+
+def safe_load(path: str, default: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def ws_broadcast(obj: Dict[str, Any]) -> None:
+    # Contract-enforcing WS broadcaster:
+    # Envelope: {type, timestamp(ms), source, data}
+    # Allowed types: TELEMETRY_UPDATE, CONTACT_NEW/UPDATE/LOST, REPLAY_STATE, COMMAND_ACK, ALERT_*, LOG_EVENT
+    disallowed = {"HELLO", "RID_DEDUPE", "RID_INPUT_COUNTS", "RID_STATS"}
+
+    et = obj.get("type")
+    if et in disallowed:
+        return
+
+    # Normalize legacy contact types if backend uses them
+    et = {
+        "RID_CONTACT_NEW": "CONTACT_NEW",
+        "RID_CONTACT_UPDATE": "CONTACT_UPDATE",
+        "RID_CONTACT_LOST": "CONTACT_LOST",
+    }.get(et, et)
+
+    # timestamp ms
+    ts = obj.get("timestamp")
+    if ts is None:
+        ts = obj.get("ts")
+    if ts is None:
+        ts = now_ts()
+
+    # Build envelope
+    if isinstance(obj.get("data"), dict) and "timestamp" in obj and "source" in obj:
+        env = obj
+        env["type"] = et
+        env["timestamp"] = ts
+        env["source"] = env.get("source") or "backend"
+        env["data"] = env.get("data") or {}
+    else:
+        data = obj.get("data")
+        if data is None:
+            data = {k: v for k, v in obj.items() if k not in ("type", "ts", "timestamp", "source")}
+        env = {"type": et, "timestamp": ts, "source": obj.get("source") or "backend", "data": data}
+
+    payload = json.dumps(env, separators=(",", ":"), ensure_ascii=False)
+
+    dead: List[Any] = []
+    with _ws_clients_lock:
+        for ws in list(_ws_clients):
+            try:
+                ws.send(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            _ws_clients.discard(ws)
+
+
+def _float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+def _str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    try:
+        s = str(v)
+        return s if s != "" else None
+    except Exception:
+        return None
+
+def _get_any(d: Dict[str, Any], keys: List[str]) -> Any:
+    for k in keys:
+        if k in d:
+            return d[k]
+    return None
+
+def parse_any_json_line(line: str) -> Optional[Dict[str, Any]]:
+    line = line.strip()
+    if not line:
+        return None
+    # ignore ES bulk index lines if present
+    if line.startswith('{"index"'):
+        return None
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
+
+
+def deep_find(obj, key):
+    """Recursively search dict/list structures and return first match for key, else None."""
+    try:
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj.get(key)
+            for v in obj.values():
+                r = deep_find(v, key)
+                if r is not None:
+                    return r
+        elif isinstance(obj, list):
+            for it in obj:
+                r = deep_find(it, key)
+                if r is not None:
+                    return r
+    except Exception:
+        return None
+    return None
+
+def normalize_event(obj: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+    ts = _float(_get_any(obj, ["ts", "timestamp", "@timestamp"]))
+    if ts is None:
+        ts = _float(obj.get("timestamp"))
+    if ts is None:
+        ts = now_ts()
+
+    layers = obj.get("layers") if isinstance(obj.get("layers"), dict) else None
+    flat = layers if layers is not None else obj
+
+    def pick(k: str) -> Any:
+        v = flat.get(k)
+        if isinstance(v, list) and v:
+            return v[0]
+        return v
+
+    fn = pick("frame.frame_number") or pick("frame_frame_number") or obj.get("frame_frame_number")
+    try:
+        frame_no = int(fn) if fn is not None else None
+    except Exception:
+        frame_no = None
+
+    msg_type    = _str(pick("OpenDroneID.msgType") or pick("opendroneid.msgType"))
+    operator_id = _str(pick("OpenDroneID.operator_id") or pick("OpenDroneID.operatorId") or pick("opendroneid.operator_id"))
+    # Deep-search EK nested structures for operator_id (layers.*) if still missing
+    if not operator_id:
+        operator_id = _str(deep_find(obj, "opendroneid_OpenDroneID_operator_id"))
+
+    basic_id    = _str(pick("OpenDroneID.basicID_id_asc") or pick("OpenDroneID.basicid_id_asc") or pick("opendroneid.basicID_id_asc"))
+
+    lat = _float(pick("OpenDroneID.loc_lat") or pick("opendroneid.loc_lat"))
+    # Deep-search EK nested structures for location if still missing
+    if lat is None:
+        lat_raw2 = deep_find(obj, "opendroneid_OpenDroneID_loc_lat")
+        try:
+            if lat_raw2 is not None:
+                lat = float(int(lat_raw2)) / 1e7
+        except Exception:
+            pass
+    if lon is None:
+        lon_raw2 = deep_find(obj, "opendroneid_OpenDroneID_loc_lon")
+        try:
+            if lon_raw2 is not None:
+                lon = float(int(lon_raw2)) / 1e7
+        except Exception:
+            pass
+    if alt_m is None:
+        alt_raw2 = deep_find(obj, "opendroneid_OpenDroneID_loc_geoAlt")
+        try:
+            if alt_raw2 is not None:
+                alt_m = float(int(alt_raw2)) / 10.0
+        except Exception:
+            pass
+
+    lon = _float(pick("OpenDroneID.loc_lon") or pick("opendroneid.loc_lon"))
+    alt_m = _float(pick("OpenDroneID.loc_alt") or pick("OpenDroneID.loc_altitude") or pick("opendroneid.loc_alt"))
+
+    mac = _str(pick("wlan.sa") or pick("wlan.ta") or pick("wlan.da") or pick("wlan.bssid") or pick("eth.src") or pick("btle.address"))
+
+    # EK (Wireshark Lua/OpenDroneID) keys sometimes appear as opendroneid_OpenDroneID_*
+    # Location lat/lon are encoded as int32 scaled by 1e7 (degrees).
+    def _odid_deg(v):
+        try:
+            if v is None:
+                return None
+            if isinstance(v, str) and v.strip() == "":
+                return None
+            iv = int(v)
+            # OpenDroneID location uses 1e7 scaling
+            return iv / 1e7
+        except Exception:
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+    def _odid_alt_m(v):
+        try:
+            if v is None:
+                return None
+            iv = int(v)
+            # geoAlt appears to be decimeters in EK dump (e.g. 2474 => 247.4 m)
+            return iv / 10.0
+        except Exception:
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+    # Prefer operator_id from EK keys if present
+    operator_id = operator_id or _str(_get_any(obj, [
+        "opendroneid_OpenDroneID_operator_id",
+        "layers.opendroneid.0.opendroneid_message_pack.opendroneid_message_operatorid.opendroneid_OpenDroneID_operator_id",
+    ]))
+
+    # Prefer location from EK keys if present
+    lat_raw = _get_any(obj, ["opendroneid_OpenDroneID_loc_lat"])
+    lon_raw = _get_any(obj, ["opendroneid_OpenDroneID_loc_lon"])
+    geo_alt = _get_any(obj, ["opendroneid_OpenDroneID_loc_geoAlt"])
+
+    lat = lat or _odid_deg(lat_raw)
+    lon = lon or _odid_deg(lon_raw)
+    alt_m = alt_m or _odid_alt_m(geo_alt)
+
+    # raw replay formats
+    msg_type = msg_type or _str(_get_any(obj, ["msg_type", "type", "rid_type", "OpenDroneID.msgType"]))
+    operator_id = operator_id or _str(_get_any(obj, ["operator_id", "OpenDroneID.operator_id"]))
+    basic_id = basic_id or _str(_get_any(obj, ["basic_id", "id", "basicID_id_asc", "OpenDroneID.basicID_id_asc"]))
+    lat = lat if lat is not None else _float(_get_any(obj, ["lat", "latitude"]))
+    lon = lon if lon is not None else _float(_get_any(obj, ["lon", "longitude"]))
+    alt_m = alt_m if alt_m is not None else _float(_get_any(obj, ["alt_m", "alt", "altitude_m"]))
+
+    return {
+        "ts": ts,
+        "source": source,
+        "msg_type": msg_type,
+        "operator_id": operator_id,
+        "basic_id": basic_id,
+        "mac": mac,
+        "lat": lat,
+        "lon": lon,
+        "alt_m": alt_m,
+        "frame_no": frame_no,
+        "raw": obj,
+    }
+
+def ek_dedupe_stream(events: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    out: List[Dict[str, Any]] = []
+    before = len(events)
+    current_frame = None
+    seen: Set[Tuple[Any, Any, Any, Any, Any, Any]] = set()
+    dupes = 0
+
+    for e in events:
+        fn = e.get("frame_no")
+        if fn != current_frame:
+            current_frame = fn
+            seen.clear()
+
+        key = (fn, e.get("msg_type"), e.get("operator_id"), e.get("basic_id"), e.get("lat"), e.get("lon"))
+        if fn is not None and key in seen:
+            dupes += 1
+            continue
+        if fn is not None:
+            seen.add(key)
+        out.append(e)
+
+    after = len(out)
+    return out, {"before": before, "after": after, "dupes": dupes}
+
+def stable_contact_id(e: Dict[str, Any]) -> str:
+    # LOCKED rules:
+    bid = e.get("basic_id")
+    if bid:
+        return f"rid:{bid}"
+    mac = e.get("mac")
+    if mac:
+        return f"rid:mac:{mac.lower()}"
+    raw = json.dumps(e.get("raw", {}), sort_keys=True, separators=(",", ":"))
+    h = str(abs(hash((e.get("operator_id"), e.get("lat"), e.get("lon"), raw))))
+    return f"rid:hash:{h}"
+
+class ContactTracker:
+    def __init__(self, ttl_s: float):
+        self.ttl_s = ttl_s
+        self.contacts: Dict[str, Dict[str, Any]] = {}
+        self.msg_ts_60s = deque()
+
+    def _prune_60s(self, t: float) -> None:
+        while self.msg_ts_60s and (t - self.msg_ts_60s[0]) > 60.0:
+            self.msg_ts_60s.popleft()
+
+    def ingest(self, e: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # message counter uses wall clock
+        self.msg_ts_60s.append(now_ts())
+        self._prune_60s(now_ts())
+
+        cid = stable_contact_id(e)
+        prev = self.contacts.get(cid)
+
+        payload = {
+            "id": cid,
+            # TTL should be wall-clock based
+            "last_ts": now_ts(),
+            "source": e.get("source"),
+            "msg_type": e.get("msg_type"),
+            "operator_id": e.get("operator_id"),
+            "basic_id": e.get("basic_id"),
+            "mac": e.get("mac"),
+            "lat": e.get("lat"),
+            "lon": e.get("lon"),
+            "alt_m": e.get("alt_m"),
+        }
+
+        if prev is None:
+            self.contacts[cid] = payload
+            return [{"type": "RID_CONTACT_NEW", "ts": now_ts(), "contact": payload}]
+        else:
+            changed = any(prev.get(k) != payload.get(k) for k in ["msg_type","operator_id","lat","lon","alt_m","mac","basic_id","source"])
+            self.contacts[cid].update(payload)
+            if changed:
+                return [{"type": "RID_CONTACT_UPDATE", "ts": now_ts(), "contact": self.contacts[cid]}]
+            return []
+
+    def expire(self) -> List[Dict[str, Any]]:
+        t = now_ts()
+        lost: List[Dict[str, Any]] = []
+        for cid, c in list(self.contacts.items()):
+            if (t - float(c.get("last_ts", 0))) > self.ttl_s:
+                lost.append({"type": "RID_CONTACT_LOST", "ts": t, "id": cid})
+                del self.contacts[cid]
+        return lost
+
+    def stats(self) -> Dict[str, Any]:
+        t = now_ts()
+        self._prune_60s(t)
+        return {"targets": len(self.contacts), "msgs_60s": len(self.msg_ts_60s)}
+
+    def snapshot_targets(self) -> List[Dict[str, Any]]:
+        return sorted(self.contacts.values(), key=lambda x: x.get("last_ts", 0), reverse=True)
+
+def load_jsonl(path: str, source: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                obj = parse_any_json_line(line)
+                if not obj:
+                    continue
+                e = normalize_event(obj, source=source)
+                if e:
+                    out.append(e)
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return out
+    return out
+
+def replay_worker(tracker: ContactTracker) -> None:
+    while not _stop.is_set():
+        REPLAY_STATE["active"] = True
+        REPLAY_STATE["last_change_ts"] = time.time()
+        raw_events = load_jsonl(RAW_JSONL_PATH, source="raw_replay")
+        ek_events  = load_jsonl(EK_JSONL_PATH,  source="ek_replay")
+        ek_events_dedup, dedupe_stats = ek_dedupe_stream(ek_events)
+
+# DISABLED_NON_CONTRACT         ws_broadcast({"type": "RID_DEDUPE", "ts": now_ts(), "ek": dedupe_stats})
+
+        # Filter RAW: ignore stats + ignore events without stable identity (basic_id/mac)
+        raw_filtered = []  # UI integration: ignore RAW frames for contacts; EK is source of truth
+        for e in raw_events:
+            mt = (e.get("msg_type") or "").lower()
+            if mt.startswith("stats_"):
+                continue
+            if e.get("basic_id") or e.get("mac"):
+                raw_filtered.append(e)
+
+        merged = raw_filtered + ek_events_dedup
+        merged.sort(key=lambda e: float(e.get("ts", 0.0)))
+
+# DISABLED_NON_CONTRACT         ws_broadcast({"type":"RID_INPUT_COUNTS","ts":now_ts(),"raw_before":len(raw_events),"raw_after":len(raw_filtered),"ek":len(ek_events_dedup)})
+
+        if not merged:
+            state = {
+                "health": {"state": "DISCONNECTED", "source": "replay", "updated_ts": now_ts()},
+                "counts": {"targets": 0, "msgs_60s": 0},
+                "targets": [],
+                "dedupe": {"ek": dedupe_stats},
+            }
+            atomic_write_json(REMOTEID_STATE_FILE, state)
+            time.sleep(1.0)
+            REPLAY_STATE["active"] = False
+            REPLAY_STATE["last_change_ts"] = time.time()
+            if not RID_REPLAY_LOOP:
+                break
+            continue
+
+        last_state_write = 0.0
+        last_stats_emit = 0.0
+
+        for e in merged:
+            if _stop.is_set():
+                break
+
+            for ev in tracker.ingest(e):
+                ws_broadcast(ev)
+
+            # expire may also be handled by expire_worker, but keep here too
+            for ev in tracker.expire():
+                ws_broadcast(ev)
+
+            t = now_ts()
+            if (t - last_stats_emit) >= RID_STATS_PERIOD_S:
+                st = tracker.stats()
+# DISABLED_NON_CONTRACT                 ws_broadcast({"type": "RID_STATS", "ts": t, "counts": st})
+                last_stats_emit = t
+
+            if (t - last_state_write) >= 0.5:
+                st = tracker.stats()
+                state = {
+                    "health": {"state": "CONNECTED", "source": "replay", "updated_ts": t},
+                    "counts": {"targets": st["targets"], "msgs_60s": st["msgs_60s"]},
+                    "targets": tracker.snapshot_targets(),
+                    "dedupe": {"ek": dedupe_stats},
+                }
+                atomic_write_json(REMOTEID_STATE_FILE, state)
+                last_state_write = t
+
+            time.sleep(RID_REPLAY_SLEEP_S)
+
+        # After replay ends, mark DEGRADED (no new data)
+        t = now_ts()
+        st = tracker.stats()
+        state = {
+            "health": {"state": "DEGRADED", "source": "replay", "updated_ts": t},
+            "counts": {"targets": st["targets"], "msgs_60s": st["msgs_60s"]},
+            "targets": tracker.snapshot_targets(),
+            "dedupe": {"ek": dedupe_stats},
+        }
+        atomic_write_json(REMOTEID_STATE_FILE, state)
+
+        # replay finished (one-shot) -> mark inactive
+        REPLAY_STATE["active"] = False
+        REPLAY_STATE["last_change_ts"] = time.time()
+
+        if not RID_REPLAY_LOOP:
+            break
+
+def expire_worker(tracker: ContactTracker) -> None:
+    # Periodically expire contacts even when replay is idle/stopped
+    while not _stop.is_set():
+        lost_events = tracker.expire()
+        if lost_events:
+            for ev in lost_events:
+                ws_broadcast(ev)
+            st = tracker.stats()
+            cur = safe_load(REMOTEID_STATE_FILE, {
+                "health": {"state":"DEGRADED","source":"replay","updated_ts":now_ts()},
+                "counts": {"targets":0,"msgs_60s":0},
+                "targets": [],
+            })
+            dedupe = cur.get("dedupe")
+            health = cur.get("health") or {"state":"DEGRADED","source":"replay","updated_ts":now_ts()}
+            health["updated_ts"] = now_ts()
+            cur["health"] = health
+            cur["counts"] = {"targets": st["targets"], "msgs_60s": st["msgs_60s"]}
+            cur["targets"] = tracker.snapshot_targets()
+            if dedupe is not None:
+                cur["dedupe"] = dedupe
+            atomic_write_json(REMOTEID_STATE_FILE, cur)
+        time.sleep(0.5)
+
+def gpsd_worker() -> None:
+    gps_state = {
+        "mode": 0,
+        "lat": None,
+        "lon": None,
+        "alt_m": None,
+        "speed_mps": None,
+        "track_deg": None,
+        "sats": None,
+        "last_ts": 0,
+    }
+
+    def write():
+        atomic_write_json(GPS_STATE_FILE, gps_state)
+
+    while not _stop.is_set():
+        s = None
+        try:
+            s = socket.create_connection(("127.0.0.1", 2947), timeout=3)
+            s.settimeout(3)
+            s.sendall(b'?WATCH={"enable":true,"json":true}\n')
+            buf = b""
+            while not _stop.is_set():
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        continue
+
+                    cls = msg.get("class")
+                    if cls == "TPV":
+                        gps_state["mode"] = int(msg.get("mode", 0) or 0)
+                        gps_state["last_ts"] = now_ts()
+                        gps_state["lat"] = msg.get("lat")
+                        gps_state["lon"] = msg.get("lon")
+                        gps_state["alt_m"] = msg.get("alt")
+                        gps_state["speed_mps"] = msg.get("speed")
+                        gps_state["track_deg"] = msg.get("track")
+                        write()
+                    elif cls == "SKY":
+                        sats = msg.get("satellites", [])
+                        used = 0
+                        try:
+                            for sat in sats:
+                                if sat.get("used"):
+                                    used += 1
+                        except Exception:
+                            used = None
+                        gps_state["sats"] = used
+                        gps_state["last_ts"] = now_ts()
+                        write()
+
+        except Exception:
+            gps_state["last_ts"] = now_ts()
+            write()
+            time.sleep(1.0)
+        finally:
+            try:
+                if s:
+                    s.close()
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+# ---- API v1 StatusSnapshot (contract) ----
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _to_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+def _to_ms(v: Any) -> Optional[int]:
+    # Convert seconds (float/int) -> unix ms
+    try:
+        if v is None:
+            return None
+        return int(float(v) * 1000)
+    except Exception:
+        return None
+
+def get_uptime_seconds() -> Optional[float]:
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return None
+
+def get_cpu_temp_celsius() -> Optional[float]:
+    # Raspberry Pi: thermal_zone0/temp is millideg C
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r", encoding="utf-8") as f:
+            return float(f.read().strip()) / 1000.0
+    except Exception:
+        return None
+
+def get_storage_gb(path: str = "/") -> Tuple[Optional[float], Optional[float]]:
+    try:
+        st = os.statvfs(path)
+        total = (st.f_frsize * st.f_blocks) / (1024**3)
+        free  = (st.f_frsize * st.f_bavail) / (1024**3)
+        return free, total
+    except Exception:
+        return None, None
+
+def build_status_v0() -> Dict[str, Any]:
+    # Must match legacy /status payload keys (do not change)
+    remoteid = safe_load(REMOTEID_STATE_FILE, {
+        "health": {"state":"DISCONNECTED","source":"replay","updated_ts":None},
+        "counts": {"targets":0,"msgs_60s":0},
+        "targets": [],
+    })
+    gps = safe_load(GPS_STATE_FILE, {
+        "mode":0,"lat":None,"lon":None,"alt_m":None,
+        "speed_mps":None,"track_deg":None,"sats":None,"last_ts":0
+    })
+    return {"ok": True, "ts": now_ts(), "remoteid": remoteid, "gps": gps}
+
+def to_status_snapshot_v1(v0: Dict[str, Any]) -> Dict[str, Any]:
+    ts_ms = now_ms()
+    free_gb, total_gb = get_storage_gb("/")
+    remoteid = v0.get("remoteid") or {}
+    gps = v0.get("gps") or {}
+
+    rid_health = remoteid.get("health") or {}
+    rid_counts = remoteid.get("counts") or {}
+    rid_status = str(rid_health.get("state") or "DISCONNECTED").lower()
+    rid_last_ms = _to_ms(rid_health.get("updated_ts"))
+
+    snap = {
+        "timestamp": ts_ms,
+        "overall_ok": bool(v0.get("ok")),
+        "system": {
+            "hostname": socket.gethostname(),
+            "version": os.environ.get("NDEFENDER_VERSION") or "dev",
+            "uptime_seconds": get_uptime_seconds(),
+            "cpu_temp_celsius": get_cpu_temp_celsius(),
+            "storage_free_gb": free_gb,
+            "storage_total_gb": total_gb,
+        },
+        "esp32": {
+            "status": "DISCONNECTED",
+            "rssi_dbm": None,
+            "uptime_seconds": None,
+        },
+        "gps": {
+            "mode": _to_int(gps.get("mode")) or 0,
+            "fix_quality": min(max(_to_int(gps.get("mode")) or 0, 0), 3),
+            "last_ts": _to_int(gps.get("last_ts")),
+
+            "satellites": _to_int(gps.get("sats")),
+            "hdop": None,
+            "latitude": _float(gps.get("lat")),
+            "longitude": _float(gps.get("lon")),
+            "altitude": _float(gps.get("alt_m")),
+            "speed": _float(gps.get("speed_mps")),
+            "heading": _float(gps.get("track_deg")),
+        },
+        "remote_id": {
+            "status": rid_status,
+            "active_contacts": _to_int(rid_counts.get("targets")) or 0,
+            "last_update_ts": rid_last_ms,
+        },
+        "fpv": {
+            "scan_state": "idle",
+            "locked_channels": [],
+        },
+        "replay": {
+            "active": bool(REPLAY_STATE.get("active")),
+        },
+    }
+    return snap
+
+@app.get("/api/v1/status")
+def api_v1_status():
+    v0 = build_status_v0()
+    return jsonify(to_status_snapshot_v1(v0))
+
+# ---- end API v1 StatusSnapshot ----
+
+@app.get("/status")
+def status():
+    remoteid = safe_load(REMOTEID_STATE_FILE, {
+        "health": {"state":"DISCONNECTED","source":"replay","updated_ts":None},
+        "counts": {"targets":0,"msgs_60s":0},
+        "targets": [],
+    })
+    gps = safe_load(GPS_STATE_FILE, {
+        "mode":0,"lat":None,"lon":None,"alt_m":None,
+        "speed_mps":None,"track_deg":None,"sats":None,"last_ts":0
+    })
+    return jsonify({"ok": True, "ts": now_ts(), "remoteid": remoteid, "gps": gps, "api": {"v1_status": "/api/v1/status", "v1_ws": "/api/v1/ws"}})
+
+def ws_session(ws):
+    # On connect: send snapshot as CONTACT_NEW events (contract) and then join broadcast set.
+    try:
+        if _TRACKER is not None:
+            for c in _TRACKER.snapshot_targets():
+                # legacy tracker emits RID_CONTACT_*; normalize here
+                ws.send(json.dumps(_ws_env("CONTACT_NEW", "backend", {"contact": c}), separators=(",",":")))
+    except Exception:
+        # If snapshot fails, still allow the socket to join broadcasts
+        pass
+
+    with _ws_clients_lock:
+        _ws_clients.add(ws)
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            # Optional: respond to keepalive/ping with contract COMMAND_ACK
+            ws.send(json.dumps(_ws_env("COMMAND_ACK", "backend", {"ok": True}), separators=(",",":")))
+    finally:
+        with _ws_clients_lock:
+            _ws_clients.discard(ws)
+
+
+    try:
+        if _TRACKER is not None:
+            for c in _TRACKER.snapshot_targets():
+                ws.send(json.dumps({"type":"RID_CONTACT_NEW","ts":now_ts(),"contact":c}, separators=(",",":")))
+    except Exception:
+        pass
+
+    with _ws_clients_lock:
+        _ws_clients.add(ws)
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            ws.send(json.dumps({"type":"ACK","ts":now_ts()}, separators=(",",":")))
+    finally:
+        with _ws_clients_lock:
+            _ws_clients.discard(ws)
+
+
+def _ws_env(msg_type: str, source: str, data: dict):
+    # Canonical WS envelope: {type, timestamp(ms), source, data}
+    return {
+        "type": msg_type,
+        "timestamp": int(time.time() * 1000),
+        "source": source,
+        "data": data,
+    }
+
+def ws_session_v1(ws):
+    # Canonical WS: HELLO + snapshot in envelope with ms timestamps
+
+    # snapshot (UI late-join safe)
+    try:
+        if _TRACKER is not None:
+            for c in _TRACKER.snapshot_targets():
+                ws.send(json.dumps(_ws_env("CONTACT_NEW", "remote_id", {"contact": c}), separators=(",",":")))
+    except Exception:
+        pass
+
+    with _ws_clients_lock:
+        _ws_clients.add(ws)
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            # keep ACK semantics for tools
+            ws.send(json.dumps(_ws_env("COMMAND_ACK", "backend", {"ok": True}), separators=(",",":")))
+    finally:
+        with _ws_clients_lock:
+            _ws_clients.discard(ws)
+
+@sock.route("/ws")
+def ws_handler(ws):
+    return ws_session(ws)
+
+@sock.route("/api/v1/ws")
+def ws_handler_v1(ws):
+    return ws_session_v1(ws)
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    atomic_write_json(REMOTEID_STATE_FILE, {
+        "health": {"state":"DISCONNECTED","source":"replay","updated_ts":now_ts()},
+        "counts": {"targets":0,"msgs_60s":0},
+        "targets": [],
+    })
+    atomic_write_json(GPS_STATE_FILE, {
+        "mode":0,"lat":None,"lon":None,"alt_m":None,
+        "speed_mps":None,"track_deg":None,"sats":None,"last_ts":0
+    })
+
+    tracker = ContactTracker(ttl_s=RID_TTL_S)
+    global _TRACKER
+    _TRACKER = tracker
+
+    threading.Thread(target=replay_worker, args=(tracker,), daemon=True).start()
+    threading.Thread(target=expire_worker, args=(tracker,), daemon=True).start()
+    threading.Thread(target=gpsd_worker, daemon=True).start()
+
+    app.run(host="0.0.0.0", port=APP_PORT, debug=False)
+
+if __name__ == "__main__":
+    main()

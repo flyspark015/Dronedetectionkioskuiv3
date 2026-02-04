@@ -1,0 +1,19 @@
+# runtime data
+maps/
+logs/
+tmp/
+tmp_codex_test/
+backend/state/
+
+# UI build artifacts
+ui-app/node_modules/
+ui-app/dist/
+
+# PMTiles
+**/*.pmtiles
+
+# OS cruft
+.DS_Store
+
+# nested repo backup
+ui-app/.git.bak/

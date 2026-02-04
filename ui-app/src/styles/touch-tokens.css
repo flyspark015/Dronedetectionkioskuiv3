@@ -1,0 +1,307 @@
+/**
+ * Touch-First Design Tokens
+ * Optimized for Android tablets, Raspberry Pi kiosks, and touch monitors
+ * 
+ * Design Principles:
+ * - Minimum touch target: 48px × 48px
+ * - Preferred touch target: 56px height for primary actions
+ * - Minimum spacing: 8-12px between interactive elements
+ * - Android-style feedback (ripple, press states)
+ * - Works with fingers and gloves
+ */
+
+@layer base {
+  :root {
+    /* ============================================
+       TOUCH TARGET SIZES (Minimum 48px)
+       ============================================ */
+    --touch-target-min: 48px;        /* Absolute minimum for any interactive element */
+    --touch-target-primary: 56px;    /* Primary buttons, critical actions */
+    --touch-target-secondary: 48px;  /* Secondary buttons, icons */
+    --touch-target-chip: 40px;       /* Filter chips, tags (can be slightly smaller) */
+    
+    /* Touch spacing (minimum gaps between targets) */
+    --touch-spacing-min: 8px;
+    --touch-spacing-comfortable: 12px;
+    --touch-spacing-generous: 16px;
+    
+    /* ============================================
+       BUTTON DIMENSIONS (Touch-Optimized)
+       ============================================ */
+    /* Primary action buttons */
+    --btn-primary-height: 56px;
+    --btn-primary-padding-x: 24px;
+    --btn-primary-padding-y: 16px;
+    --btn-primary-radius: 16px;      /* Rounded rectangle, NOT pill */
+    
+    /* Secondary action buttons */
+    --btn-secondary-height: 48px;
+    --btn-secondary-padding-x: 20px;
+    --btn-secondary-padding-y: 12px;
+    --btn-secondary-radius: 12px;
+    
+    /* Icon buttons (square, NOT circle) */
+    --btn-icon-size: 48px;
+    --btn-icon-radius: 12px;         /* Rounded square */
+    
+    /* Small buttons (use sparingly) */
+    --btn-small-height: 40px;
+    --btn-small-padding-x: 16px;
+    --btn-small-padding-y: 8px;
+    --btn-small-radius: 10px;
+    
+    /* ============================================
+       PRESS STATE TRANSFORMS
+       ============================================ */
+    --press-scale: 0.97;             /* Slight scale down on press */
+    --press-opacity: 0.9;            /* Slight darken */
+    --press-duration: 100ms;         /* Fast feedback */
+    
+    /* ============================================
+       RIPPLE EFFECT (Android-style)
+       ============================================ */
+    --ripple-duration: 600ms;
+    --ripple-color: rgba(255, 255, 255, 0.15);
+    --ripple-color-dark: rgba(0, 0, 0, 0.15);
+    
+    /* ============================================
+       CARD DIMENSIONS (Touch-Optimized)
+       ============================================ */
+    --card-padding: 16px;
+    --card-radius: 16px;             /* Large rounded corners */
+    --card-min-height: 80px;         /* Ensure cards are easy to tap */
+    --card-spacing: 12px;            /* Space between cards */
+    
+    /* ============================================
+       BOTTOM SHEET (Android Native Feel)
+       ============================================ */
+    --sheet-drag-handle-width: 48px;
+    --sheet-drag-handle-height: 4px;
+    --sheet-drag-handle-radius: 2px;
+    --sheet-header-height: 64px;     /* Large drag area */
+    --sheet-border-radius: 24px;     /* Large top radius */
+    
+    /* Snap points (percentages of viewport height) */
+    --sheet-snap-collapsed: 20vh;
+    --sheet-snap-half: 50vh;
+    --sheet-snap-full: 90vh;
+    
+    /* ============================================
+       TAB BAR (Touch-Optimized)
+       ============================================ */
+    --tab-bar-height: 64px;          /* Taller for easier tapping */
+    --tab-item-height: 64px;
+    --tab-indicator-height: 4px;
+    
+    /* ============================================
+       MAP CONTROLS (Touch-Friendly)
+       ============================================ */
+    --map-control-size: 48px;
+    --map-control-spacing: 12px;
+    --map-control-radius: 12px;
+    
+    /* ============================================
+       CHIP DIMENSIONS (Filter/Tag)
+       ============================================ */
+    --chip-height: 40px;
+    --chip-padding-x: 16px;
+    --chip-padding-y: 8px;
+    --chip-radius: 20px;             /* Pill shape for chips only */
+    --chip-spacing: 8px;
+    
+    /* ============================================
+       DRAG HANDLE (Visible affordance)
+       ============================================ */
+    --drag-handle-width: 48px;
+    --drag-handle-height: 4px;
+    --drag-handle-radius: 2px;
+    --drag-handle-color: rgba(255, 255, 255, 0.3);
+    
+    /* ============================================
+       ORIENTATION BREAKPOINTS
+       ============================================ */
+    /* These are used in media queries */
+    --breakpoint-portrait-max: 800px;
+    --breakpoint-landscape-min: 801px;
+    --breakpoint-large-min: 1281px;
+  }
+}
+
+/* ============================================
+   TOUCH FEEDBACK UTILITIES
+   ============================================ */
+
+/* Base touch feedback - applies to all interactive elements */
+@layer utilities {
+  .touch-target {
+    min-width: var(--touch-target-min);
+    min-height: var(--touch-target-min);
+    cursor: pointer;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  
+  /* Primary touch target (larger) */
+  .touch-target-primary {
+    min-height: var(--touch-target-primary);
+  }
+  
+  /* Press state (scale + opacity) */
+  .press-feedback {
+    transition: transform var(--press-duration) ease,
+                opacity var(--press-duration) ease;
+  }
+  
+  .press-feedback:active {
+    transform: scale(var(--press-scale));
+    opacity: var(--press-opacity);
+  }
+  
+  /* Disabled state */
+  .touch-disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+  
+  /* Android-style ripple container */
+  .ripple-container {
+    position: relative;
+    overflow: hidden;
+  }
+  
+  /* Ripple effect (requires JavaScript) */
+  .ripple {
+    position: absolute;
+    border-radius: 50%;
+    background-color: var(--ripple-color);
+    transform: scale(0);
+    animation: ripple-animation var(--ripple-duration) ease-out;
+    pointer-events: none;
+  }
+  
+  @keyframes ripple-animation {
+    to {
+      transform: scale(4);
+      opacity: 0;
+    }
+  }
+  
+  /* Touch-friendly spacing */
+  .touch-spacing-min {
+    gap: var(--touch-spacing-min);
+  }
+  
+  .touch-spacing-comfortable {
+    gap: var(--touch-spacing-comfortable);
+  }
+  
+  .touch-spacing-generous {
+    gap: var(--touch-spacing-generous);
+  }
+}
+
+/* ============================================
+   ORIENTATION-SPECIFIC STYLES
+   ============================================ */
+
+/* Portrait mode (≤800px, typically 7" kiosk in portrait) */
+@media (max-width: 800px) {
+  :root {
+    /* Increase touch targets slightly in portrait */
+    --btn-primary-height: 56px;
+    --btn-secondary-height: 52px;
+    --btn-icon-size: 52px;
+    
+    /* Increase spacing for easier thumb reach */
+    --touch-spacing-comfortable: 16px;
+  }
+}
+
+/* Landscape mode (>800px, tablets and desktop) */
+@media (min-width: 801px) {
+  :root {
+    /* Standard touch targets for landscape */
+    --btn-primary-height: 56px;
+    --btn-secondary-height: 48px;
+    --btn-icon-size: 48px;
+  }
+}
+
+/* Large displays (>1280px, desktop monitors) */
+@media (min-width: 1281px) {
+  :root {
+    /* Can use slightly smaller targets on desktop (still touch-friendly) */
+    --btn-secondary-height: 44px;
+    --btn-small-height: 36px;
+  }
+}
+
+/* Height-constrained (≤600px, landscape on small screens) */
+@media (max-height: 600px) {
+  :root {
+    /* Reduce vertical spacing when height is limited */
+    --card-min-height: 64px;
+    --tab-bar-height: 56px;
+    --sheet-header-height: 56px;
+  }
+}
+
+/* ============================================
+   GESTURE HINTS
+   ============================================ */
+
+/* Drag handle styling */
+.drag-handle {
+  width: var(--drag-handle-width);
+  height: var(--drag-handle-height);
+  border-radius: var(--drag-handle-radius);
+  background-color: var(--drag-handle-color);
+  margin: 12px auto 8px;
+  flex-shrink: 0;
+}
+
+/* Swipeable hint (subtle left/right affordance) */
+.swipeable-hint {
+  position: relative;
+}
+
+.swipeable-hint::after {
+  content: '';
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  opacity: 0.3;
+  background: linear-gradient(to right, transparent, currentColor);
+  pointer-events: none;
+}
+
+/* ============================================
+   ACCESSIBILITY ENHANCEMENTS
+   ============================================ */
+
+/* Focus visible for keyboard navigation */
+.focus-visible-ring:focus-visible {
+  outline: 3px solid var(--color-info);
+  outline-offset: 2px;
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+  :root {
+    --press-opacity: 0.8;
+    --ripple-color: rgba(255, 255, 255, 0.3);
+  }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  .press-feedback,
+  .ripple {
+    transition: none;
+    animation: none;
+  }
+}

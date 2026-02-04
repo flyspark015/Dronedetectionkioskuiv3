@@ -1,0 +1,80 @@
+# AC_USERNAME= AC_PASSWORD= goreleaser release --rm-dist --parallelism 1
+before:
+  hooks:
+    - go mod tidy
+builds:
+  - binary: pmtiles
+    id: go-pmtiles
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+  - binary: pmtiles
+    id: pmtiles-macos-amd64
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - darwin
+    goarch:
+      - amd64
+    hooks:
+      post:
+        - cmd: 'codesign -s "Developer ID Application: Brandon Liu (WNSC27EEHU)" -v {{ .Path }} --options=runtime'
+          output: true
+        - cmd: zip -j "{{ .Path }}_signed.zip" {{ .Path }}
+        - cmd: xcrun notarytool submit "{{ .Path }}_signed.zip" --apple-id {{ .Env.AC_USERNAME }} --password {{ .Env.AC_PASSWORD }} --team-id WNSC27EEHU --wait
+        - mv {{ .Path }}_signed.zip dist/go-pmtiles-{{ .Version }}_Darwin_x86_64.zip
+  - binary: pmtiles
+    id: pmtiles-macos-arm64
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - darwin
+    goarch:
+      - arm64
+    hooks:
+      post:
+        - cmd: 'codesign -s "Developer ID Application: Brandon Liu (WNSC27EEHU)" -v {{ .Path }} --options=runtime'
+          output: true
+        - cmd: zip -j "{{ .Path }}_signed.zip" {{ .Path }}
+        - cmd: xcrun notarytool submit "{{ .Path }}_signed.zip" --apple-id {{ .Env.AC_USERNAME }} --password {{ .Env.AC_PASSWORD }} --team-id WNSC27EEHU --wait
+        - mv {{ .Path }}_signed.zip dist/go-pmtiles-{{ .Version }}_Darwin_arm64.zip
+archives:
+  - id: default
+    builds:
+      - go-pmtiles
+    replacements:
+      linux: Linux
+      windows: Windows
+      amd64: x86_64
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  disable: true
+
+snapshot:
+  name_template: "{{ .Tag }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+release:
+  extra_files:
+    - glob: ./dist/*_Darwin_arm64.zip
+    - glob: ./dist/*_Darwin_x86_64.zip

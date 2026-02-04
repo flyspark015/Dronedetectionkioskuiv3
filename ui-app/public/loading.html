@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>N-Defender Loading</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0f1a; color: #e5e7eb; font-family: Arial, sans-serif; }
+      .wrap { height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; }
+      .title { font-size: 32px; font-weight: 700; letter-spacing: 0.5px; }
+      .sub { font-size: 14px; color: #9ca3af; }
+      .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #3b82f6; margin: 0 4px; animation: pulse 1s infinite ease-in-out; }
+      .dot:nth-child(2) { animation-delay: 0.2s; }
+      .dot:nth-child(3) { animation-delay: 0.4s; }
+      @keyframes pulse { 0%, 100% { opacity: 0.2; transform: scale(0.9);} 50% { opacity: 1; transform: scale(1.1);} }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="title">N-Defender</div>
+      <div class="sub">Loading<span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+      <div class="sub" id="status">Waiting for backend…</div>
+    </div>
+    <script>
+      const statusEl = document.getElementById('status');
+      let tries = 0;
+      async function ping() {
+        tries += 1;
+        try {
+          const res = await fetch('/api/v1/status', { cache: 'no-store' });
+          if (res.ok) {
+            window.location.href = '/';
+            return;
+          }
+        } catch (e) {}
+        statusEl.textContent = tries < 5 ? 'Waiting for backend…' : 'Still starting…';
+        setTimeout(ping, 1000);
+      }
+      setTimeout(ping, 300);
+    </script>
+  </body>
+</html>

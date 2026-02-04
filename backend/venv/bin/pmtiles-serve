@@ -1,0 +1,3 @@
+#!/opt/ndefender/backend/venv/bin/python3
+
+print('This command has been deprecated; see the "pmtiles serve" command at https://github.com/protomaps/go-pmtiles')

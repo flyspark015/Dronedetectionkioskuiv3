@@ -1,0 +1,5 @@
+dist/
+go-pmtiles
+*.pmtiles
+*.geojson
+*.tsv.gz

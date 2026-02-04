@@ -1,0 +1,420 @@
+@import "tailwindcss";
+@import "./fonts.css";
+@import "./touch-tokens.css";
+
+/* N-Defender Theme - Professional Rugged Operator Console */
+@theme {
+  /* ============================================
+     BREAKPOINTS (for reference, used in media queries below)
+     ============================================ */
+  /* Small: ≤800px (7" portrait kiosk) */
+  /* Medium: 801-1280px (7" landscape, tablets) */
+  /* Large: >1280px (desktop monitors) */
+
+  /* ============================================
+     COLOR PALETTE - 60-30-10 Rule
+     ============================================ */
+  /* Dominant (60%): Dark slate backgrounds for low eye strain */
+  --color-slate-950: #0a0f1a;
+  --color-slate-900: #0f1419;
+  --color-slate-850: #151b24;
+  --color-slate-800: #1a2230;
+  --color-slate-750: #1f2838;
+  
+  /* Secondary (30%): Mid-tone grays for cards and elevated surfaces */
+  --color-slate-700: #293548;
+  --color-slate-600: #3d4f66;
+  --color-slate-500: #5d7089;
+  
+  /* Accent (10%): High contrast text and interactive elements */
+  --color-slate-400: #8b9bb0;
+  --color-slate-300: #b4c1d3;
+  --color-slate-200: #dce3ed;
+  --color-slate-100: #f0f4f8;
+
+  /* Semantic Colors - High Contrast for Accessibility */
+  --color-success: #10b981;
+  --color-success-dark: #059669;
+  --color-success-bg: rgba(16, 185, 129, 0.15);
+  
+  --color-warning: #f59e0b;
+  --color-warning-dark: #d97706;
+  --color-warning-bg: rgba(245, 158, 11, 0.15);
+  
+  --color-danger: #ef4444;
+  --color-danger-dark: #dc2626;
+  --color-danger-bg: rgba(239, 68, 68, 0.15);
+  
+  --color-info: #3b82f6;
+  --color-info-dark: #2563eb;
+  --color-info-bg: rgba(59, 130, 246, 0.15);
+
+  /* Severity Colors */
+  --color-critical: #dc2626;
+  --color-high: #f97316;
+  --color-medium: #f59e0b;
+  --color-low: #3b82f6;
+
+  /* Type Colors */
+  --color-remote-id: #8b5cf6;
+  --color-fpv: #ec4899;
+  --color-unknown: #6b7280;
+
+  /* ============================================
+     FLUID TYPOGRAPHY - Scales between breakpoints
+     ============================================ */
+  /* Font sizes use clamp(min, preferred, max) */
+  --font-display: clamp(1.75rem, 2.5vw, 2.25rem);     /* 28-36px */
+  --font-h1: clamp(1.5rem, 2.2vw, 1.875rem);          /* 24-30px */
+  --font-h2: clamp(1.25rem, 1.8vw, 1.5rem);           /* 20-24px */
+  --font-h3: clamp(1.125rem, 1.5vw, 1.25rem);         /* 18-20px */
+  --font-body-lg: clamp(1rem, 1.2vw, 1.125rem);       /* 16-18px */
+  --font-body: clamp(0.875rem, 1vw, 1rem);            /* 14-16px */
+  --font-body-sm: clamp(0.8125rem, 0.9vw, 0.875rem);  /* 13-14px */
+  --font-caption: clamp(0.75rem, 0.85vw, 0.8125rem);  /* 12-13px */
+  --font-micro: clamp(0.6875rem, 0.8vw, 0.75rem);     /* 11-12px */
+
+  /* Line Heights - ~1.5x for readability */
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.75;
+
+  /* Font Weights */
+  --font-normal: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+  --font-bold: 700;
+
+  /* ============================================
+     SPACING SCALE - Consistent 4px-based system
+     ============================================ */
+  --space-0: 0;
+  --space-1: 0.25rem;   /* 4px */
+  --space-2: 0.5rem;    /* 8px */
+  --space-3: 0.75rem;   /* 12px */
+  --space-4: 1rem;      /* 16px */
+  --space-5: 1.25rem;   /* 20px */
+  --space-6: 1.5rem;    /* 24px */
+  --space-8: 2rem;      /* 32px */
+  --space-10: 2.5rem;   /* 40px */
+  --space-12: 3rem;     /* 48px */
+  --space-16: 4rem;     /* 64px */
+  --space-20: 5rem;     /* 80px */
+
+  /* ============================================
+     TOUCH TARGETS - Minimum sizes for accessibility
+     ============================================ */
+  --touch-min: 48px;           /* Minimum touch target */
+  --touch-comfortable: 56px;   /* Comfortable primary actions */
+  --touch-large: 64px;         /* Large prominent actions */
+  --touch-spacing: 0.5rem;     /* 8px minimum between targets */
+
+  /* ============================================
+     BORDER RADIUS - Consistent rounded corners
+     ============================================ */
+  --radius-sm: 0.5rem;    /* 8px */
+  --radius-md: 0.75rem;   /* 12px */
+  --radius-lg: 1rem;      /* 16px */
+  --radius-xl: 1.25rem;   /* 20px */
+  --radius-2xl: 1.5rem;   /* 24px */
+  --radius-full: 9999px;
+
+  /* ============================================
+     LAYOUT - AppShell structure with safe areas
+     ============================================ */
+  --status-bar-height: clamp(48px, 6vh, 56px);
+  --status-bar-height-critical: clamp(72px, 9vh, 80px);
+  --tab-bar-height: clamp(64px, 8vh, 76px);
+  --panic-controls-height: clamp(56px, 7vh, 64px);
+
+  /* Safe area calculations */
+  --safe-area-top: var(--status-bar-height);
+  --safe-area-top-critical: var(--status-bar-height-critical);
+  --safe-area-bottom: var(--tab-bar-height);
+  --panic-bottom-offset: calc(var(--tab-bar-height) + 0.75rem);
+
+  /* ============================================
+     SHADOWS - Depth hierarchy
+     ============================================ */
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.25);
+  --shadow-sm: 0 2px 4px 0 rgb(0 0 0 / 0.3);
+  --shadow-md: 0 4px 8px -1px rgb(0 0 0 / 0.35), 0 2px 4px -2px rgb(0 0 0 / 0.35);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.4), 0 4px 6px -4px rgb(0 0 0 / 0.4);
+  --shadow-xl: 0 20px 25px -5px rgb(0 0 0 / 0.5), 0 8px 10px -6px rgb(0 0 0 / 0.5);
+
+  /* Performance-optimized shadows */
+  --shadow-subtle: 0 1px 3px 0 rgb(0 0 0 / 0.2);
+  --shadow-card: 0 2px 4px 0 rgb(0 0 0 / 0.3);
+
+  /* ============================================
+     TRANSITIONS - Smooth but performant
+     ============================================ */
+  --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-base: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-slow: 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Base styles */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Performance mode - can be toggled via body class */
+body.performance-mode * {
+  transition: none !important;
+  animation: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+body.performance-mode .glass {
+  background: var(--color-slate-900);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+body {
+  background-color: var(--color-slate-950);
+  color: var(--color-slate-100);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: var(--font-body);
+  line-height: var(--leading-normal);
+  overflow: hidden;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Touch-friendly sliders */
+input[type="range"].range-lg {
+  height: 0.9rem;
+}
+
+input[type="range"].range-lg::-webkit-slider-runnable-track {
+  height: 0.5rem;
+}
+
+input[type="range"].range-lg::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 9999px;
+  background: #3b82f6;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  margin-top: -10px;
+}
+
+input[type="range"].range-lg::-moz-range-thumb {
+  width: 28px;
+  height: 28px;
+  border-radius: 9999px;
+  background: #3b82f6;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+}
+
+/* Prevent scrolling on the body */
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+  position: fixed;
+  width: 100%;
+}
+
+/* Custom scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-slate-850);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-slate-600);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-slate-500);
+}
+
+/* Typography defaults */
+h1, h2, h3, h4, h5, h6 {
+  font-weight: var(--font-semibold);
+  line-height: var(--leading-tight);
+  color: var(--color-slate-100);
+}
+
+h1 {
+  font-size: var(--font-h1);
+}
+
+h2 {
+  font-size: var(--font-h2);
+}
+
+h3 {
+  font-size: var(--font-h3);
+}
+
+button {
+  font-family: inherit;
+}
+
+/* Smooth scrolling for panels */
+.scroll-panel {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* Animations */
+@keyframes slide-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes slide-down {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s ease-out;
+}
+
+.animate-slide-down {
+  animation: slide-down 0.3s ease-out;
+}
+
+/* Touch interactions */
+.touch-none {
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Smooth drawer transitions */
+.drawer-transition {
+  transition: height 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Grab cursor */
+.cursor-grab {
+  cursor: grab;
+  cursor: -webkit-grab;
+}
+
+.cursor-grabbing,
+.active\:cursor-grabbing:active {
+  cursor: grabbing;
+  cursor: -webkit-grabbing;
+}
+
+/* Custom utilities */
+.active\:scale-95:active {
+  transform: scale(0.95);
+}
+
+.active\:scale-98:active {
+  transform: scale(0.98);
+}
+
+/* Glass morphism effect */
+.glass {
+  background: rgba(15, 20, 25, 0.8);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* AppShell Layout Utilities */
+.app-shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.app-shell-content {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Horizontal scroll for chips */
+.chips-scroll {
+  display: flex;
+  gap: var(--space-2);
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  padding: var(--space-1) 0;
+}
+
+.chips-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* Responsive breakpoints for professional scaling */
+
+/* ≤800px: Small kiosks and portrait tablets */
+@media (max-width: 800px) {
+  :root {
+    /* Slightly smaller spacing on small screens */
+    --space-4: 0.875rem; /* 14px instead of 16px */
+    --space-6: 1.25rem;  /* 20px instead of 24px */
+  }
+  
+  /* Stack elements more vertically */
+  .responsive-stack-sm {
+    flex-direction: column !important;
+  }
+}
+
+/* 801-1280px: 7" landscape kiosks and tablets */
+@media (min-width: 801px) and (max-width: 1280px) {
+  :root {
+    /* Standard spacing works well here */
+  }
+}
+
+/* >1280px: Large monitors and desktops */
+@media (min-width: 1281px) {
+  :root {
+    /* Slightly more generous spacing */
+    --space-6: 1.75rem;  /* 28px instead of 24px */
+    --space-8: 2.25rem;  /* 36px instead of 32px */
+  }
+  
+  /* Allow side-by-side layouts */
+  .responsive-columns-lg {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: var(--space-4);
+  }
+}
+
+/* Height-based adjustments */
+@media (max-height: 600px) {
+  :root {
+    /* Compact vertical spacing on short screens */
+    --space-4: 0.75rem;  /* 12px */
+    --space-6: 1rem;     /* 16px */
+  }
+}
