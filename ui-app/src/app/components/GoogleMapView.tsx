@@ -618,7 +618,7 @@ export function GoogleMapView({
           defaultCenter={initialCenter}
           defaultZoom={16}
           options={{
-            mapTypeId: 'hybrid',
+            mapTypeId: 'roadmap',
             ...(mapId ? { mapId } : {}),
             fullscreenControl: false,
             streetViewControl: false,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, time, threading, socket, subprocess, math, shutil, re, urllib.request, urllib.error, hashlib
+import json, os, time, threading, socket, subprocess, math, shutil, re, urllib.request, urllib.error, hashlib, struct
 from pathlib import Path
 import serial
 from typing import Any, Dict, Optional, Set, List, Tuple
@@ -45,6 +45,8 @@ RF_SENSOR_DEGRADED_MS = 15000
 RF_SENSOR_ACTIVE_MS = 2000
 RF_CONTACT_TTL_MS = 7000
 
+STYLE_SAVE_FILE = os.path.join(STATE_DIR, "style_saved.json")
+
 # Phase-1.1 replay-only
 RID_TTL_S = 15.0
 RID_REPLAY_LOOP = (os.environ.get("NDEFENDER_REPLAY_LOOP","0") == "1")  # 1=loop, 0=one-shot
@@ -71,6 +73,10 @@ def ui_assets(path):
     if full.exists() and full.is_file():
         return send_from_directory(app.static_folder, path)
     return send_from_directory(app.static_folder, "index.html")
+
+@app.get("/map.html")
+def map_debug_page():
+    return send_from_directory(app.static_folder, "map.html")
 # ---- END UI STATIC SERVE ----
 
 @app.post("/api/v1/ui/debug/maplibre")
@@ -96,6 +102,29 @@ def api_ui_debug_settings_post():
 @app.get("/api/v1/ui/debug/settings")
 def api_ui_debug_settings_get():
     return jsonify({"ok": True, "events": list(UI_DEBUG_SETTINGS)})
+
+@app.post("/api/v1/style/save")
+def api_style_save():
+    data = request.get_data(cache=False, as_text=True) or ""
+    if len(data) > 5_000_000:
+        return jsonify({"ok": False, "error": "style too large"}), 413
+    try:
+        obj = json.loads(data) if data else (request.get_json(silent=True) or {})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"invalid json: {e}"}), 400
+    os.makedirs(STATE_DIR, exist_ok=True)
+    pretty = json.dumps(obj, ensure_ascii=True, indent=2)
+    with open(STYLE_SAVE_FILE, "w", encoding="utf-8") as f:
+        f.write(pretty)
+    return jsonify({"ok": True, "bytes": len(pretty)})
+
+@app.get("/api/v1/style/saved")
+def api_style_saved():
+    if not os.path.exists(STYLE_SAVE_FILE):
+        return jsonify({"ok": False, "error": "not found"}), 404
+    with open(STYLE_SAVE_FILE, "r", encoding="utf-8") as f:
+        content = f.read()
+    return app.response_class(content, mimetype="application/json")
 
 sock = Sock(app)
 
@@ -1745,6 +1774,37 @@ def esp32_send_cmd(cmd_obj: dict, timeout_s: float = 1.0) -> dict:
         with _pending_lock:
             _pending_cmd.pop(req_id, None)
 
+
+def _play_local_beep(duration_ms: int, freq_hz: int = 880, volume: float = 0.2) -> bool:
+    """Best-effort local beep via aplay (fallback if ESP32 buzzer isn't audible)."""
+    try:
+        if duration_ms <= 0:
+            return False
+        if shutil.which("aplay") is None:
+            return False
+        rate = 44100
+        frames = int(rate * (duration_ms / 1000.0))
+        if frames <= 0:
+            return False
+        amp = int(32767 * max(0.0, min(volume, 1.0)))
+        buf = bytearray()
+        two_pi = 2.0 * math.pi
+        for i in range(frames):
+            sample = int(amp * math.sin(two_pi * freq_hz * i / rate))
+            buf.extend(struct.pack("<h", sample))
+        proc = subprocess.Popen(
+            ["aplay", "-q", "-f", "S16_LE", "-r", str(rate), "-c", "1"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if proc.stdin:
+            proc.stdin.write(buf)
+            proc.stdin.close()
+        return True
+    except Exception:
+        return False
+
 def _pick_strongest_vrx_id() -> Optional[int]:
     try:
         with _ctrl_lock:
@@ -2145,9 +2205,13 @@ def api_esp32_buzzer_test():
 
     ws_broadcast(_ws_env("COMMAND_ACK", "esp32", ack))
 
-    if not res.get("ok"):
+    local_enabled = str(os.environ.get("NDEFENDER_LOCAL_BUZZER", "1")).lower() in ("1", "true", "yes", "on")
+    local_ok = _play_local_beep(duration_ms) if local_enabled else None
+
+    esp32_ok = bool(res.get("ok"))
+    if not esp32_ok and not local_ok:
         return jsonify({"ok": False, "error": res.get("err") or "send_failed"}), 500
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "esp32_ok": esp32_ok, "local_ok": local_ok, "local_enabled": local_enabled})
 
 @app.route("/api/v1/maps/packs/download", methods=["POST"])
 def api_maps_pack_download():

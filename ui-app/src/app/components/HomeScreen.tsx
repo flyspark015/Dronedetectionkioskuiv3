@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { DraggableDrawer } from './DraggableDrawer';
 import { ContactsDrawerContent } from './ContactsDrawerContent';
 import { MapHUD } from './MapHUD';
-import { MapLibreView } from './MapLibreView';
+import { GoogleMapView } from './GoogleMapView';
 import { SelectedContactOverlay } from './SelectedContactOverlay';
 import { MapToolStack } from './MapToolStack';
 import { CompassControl } from './CompassControl';
@@ -40,9 +40,7 @@ export function HomeScreen({
 
   // Count Remote ID contacts for map markers
   const remoteIdCount = contacts.filter(c => c.type === 'REMOTE_ID').length;
-  const mapReady = pmtilesReady;
-  const activePackId = mapReady ? 'india' : null;
-  const overlayLabel = 'Offline map not available';
+  const activePackId = pmtilesReady ? 'india' : null;
 
   // Mock telemetry and GPS data
   const telemetryAge = 2;
@@ -151,22 +149,16 @@ export function HomeScreen({
         isFullscreenMap ? 'bg-slate-950' : ''
       }`}>
         <div className="absolute inset-0">
-          <MapLibreView
-            online={false}
+          <GoogleMapView
+            contacts={contacts}
             gpsFixQuality={gpsFixQuality}
             gpsLatitude={gpsLatitude ?? null}
             gpsLongitude={gpsLongitude ?? null}
-            activePackId={activePackId}
+            focusContact={selectedContact}
+            mapMode="online"
+            offlinePackId={activePackId}
           />
         </div>
-
-        {!mapReady && (
-          <div className="absolute inset-0 z-20 flex items-center justify-center">
-            <div className="rounded-2xl border border-slate-700 bg-slate-900/95 px-4 py-2 text-[13px] text-slate-100 shadow-lg">
-              {overlayLabel}
-            </div>
-          </div>
-        )}
 
         {/* Map HUD - top-left */}
         <MapHUD

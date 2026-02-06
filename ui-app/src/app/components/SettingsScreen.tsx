@@ -350,7 +350,8 @@ export function SettingsScreen({
   return (
     <div
       ref={scrollRef}
-      className="h-full min-h-screen overflow-y-auto scroll-panel px-4 pb-4 pt-[calc(76px+env(safe-area-inset-top))] space-y-4"
+      className="flex-1 min-h-0 overflow-y-auto scroll-panel px-4 pb-4 pt-[calc(76px+env(safe-area-inset-top))] space-y-4"
+      style={{ touchAction: 'pan-y' }}
     >
       {/* Audio Section */}
       <section>

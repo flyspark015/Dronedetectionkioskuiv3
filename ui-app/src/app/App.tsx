@@ -596,7 +596,7 @@ const handleContactClick = (contact: Contact) => {
             onToggleReplay={setIsReplayMode}
           />
         </div>
-        <div className={activeTab === 'settings' ? 'block' : 'hidden'}>
+        <div className={activeTab === 'settings' ? 'flex h-full min-h-0 flex-col' : 'hidden'}>
           <SettingsErrorBoundary onReset={() => setSettingsErrorKey((prev) => prev + 1)}>
             <SettingsScreen
               key={settingsErrorKey}
