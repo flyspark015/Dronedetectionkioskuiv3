@@ -5,38 +5,49 @@
       <script>
       (function () {
         const g = typeof globalThis !== 'undefined' ? globalThis : window;
-        if (!g.crypto) g.crypto = {};
-        if (typeof g.crypto.randomUUID !== 'function') {
-          const poly = function () {
-            if (g.crypto && typeof g.crypto.getRandomValues === 'function') {
-              const buf = new Uint8Array(16);
-              g.crypto.getRandomValues(buf);
-              buf[6] = (buf[6] & 0x0f) | 0x40;
-              buf[8] = (buf[8] & 0x3f) | 0x80;
-              const hex = [...buf].map(b => b.toString(16).padStart(2, '0')).join('');
-              return (
-                hex.slice(0, 8) + '-' +
-                hex.slice(8, 12) + '-' +
-                hex.slice(12, 16) + '-' +
-                hex.slice(16, 20) + '-' +
-                hex.slice(20)
-              );
-            }
-            return 'uuid-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2);
-          };
-          try { g.crypto.randomUUID = poly; }
-          catch (e) {
-            try { Object.defineProperty(g.crypto, 'randomUUID', { value: poly, configurable: true }); }
-            catch (_) {}
+        const poly = function () {
+          if (g.crypto && typeof g.crypto.getRandomValues === 'function') {
+            const buf = new Uint8Array(16);
+            g.crypto.getRandomValues(buf);
+            buf[6] = (buf[6] & 0x0f) | 0x40;
+            buf[8] = (buf[8] & 0x3f) | 0x80;
+            const hex = [...buf].map(b => b.toString(16).padStart(2, '0')).join('');
+            return (
+              hex.slice(0, 8) + '-' +
+              hex.slice(8, 12) + '-' +
+              hex.slice(12, 16) + '-' +
+              hex.slice(16, 20) + '-' +
+              hex.slice(20)
+            );
           }
+          return 'uuid-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2);
+        };
+        let cryptoObj = g.crypto;
+        if (!cryptoObj || typeof cryptoObj !== 'object') cryptoObj = {};
+        try {
+          const CryptoCtor = g.Crypto;
+          if (CryptoCtor && CryptoCtor.prototype && typeof CryptoCtor.prototype.randomUUID !== 'function') {
+            CryptoCtor.prototype.randomUUID = poly;
+          }
+        } catch (_) {}
+        if (typeof cryptoObj.randomUUID !== 'function') {
+          try { cryptoObj.randomUUID = poly; } catch (_) {}
+          try { Object.defineProperty(cryptoObj, 'randomUUID', { value: poly, configurable: true, writable: true }); } catch (_) {}
+        }
+        if (!g.crypto || g.crypto !== cryptoObj || typeof g.crypto.randomUUID !== 'function') {
+          try { Object.defineProperty(g, 'crypto', { value: cryptoObj, configurable: true, writable: true }); } catch (_) {}
+          try { g.crypto = cryptoObj; } catch (_) {}
+        }
+        if (typeof g.crypto?.randomUUID !== 'function') {
+          try { g.randomUUID = poly; } catch (_) {}
         }
       })();
       </script>
       <meta charset="UTF-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1.0" />
       <title>Drone Detection Kiosk UI v3</title>
-      <script type="module" crossorigin src="/assets/index-BtmOUWji.js"></script>
-      <link rel="stylesheet" crossorigin href="/assets/index-CLKsKhNr.css">
+      <script type="module" crossorigin src="/assets/index-Bf6u7Zuz.js"></script>
+      <link rel="stylesheet" crossorigin href="/assets/index-BSbANVSE.css">
     </head>
 
     <body>

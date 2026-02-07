@@ -30,6 +30,7 @@ export type WebSocketEventType =
   | 'CONTACT_UPDATE'
   | 'CONTACT_LOST'
   | 'REPLAY_STATE'
+  | 'NETWORK_UPDATE'
   // Future events
   | 'ALERT_NEW'
   | 'ALERT_UPDATE'
@@ -158,6 +159,7 @@ export class WebSocketService {
           'CONTACT_UPDATE',
           'CONTACT_LOST',
           'REPLAY_STATE',
+          'NETWORK_UPDATE',
         ]);
         // Continue processing (might be future event type)
       }
@@ -205,6 +207,7 @@ export class WebSocketService {
       'CONTACT_UPDATE',
       'CONTACT_LOST',
       'REPLAY_STATE',
+      'NETWORK_UPDATE',
       'ALERT_NEW',
       'ALERT_UPDATE',
       'LOG_EVENT',

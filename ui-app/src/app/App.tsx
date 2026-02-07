@@ -16,6 +16,28 @@ import { sendEsp32Command } from './services/esp32Commands';
 import { playSound, preloadAudioAssets, resumeAudio } from './services/audioCommands';
 import type { Contact } from './types/contacts';
 
+// Ensure crypto.randomUUID exists for older runtimes.
+(() => {
+  const g: any = typeof globalThis !== 'undefined' ? globalThis : window;
+  if (!g.crypto) g.crypto = {};
+  if (typeof g.crypto.randomUUID !== 'function') {
+    const poly = () => {
+      if (g.crypto && typeof g.crypto.getRandomValues === 'function') {
+        const buf = new Uint8Array(16);
+        g.crypto.getRandomValues(buf);
+        buf[6] = (buf[6] & 0x0f) | 0x40;
+        buf[8] = (buf[8] & 0x3f) | 0x80;
+        const hex = Array.from(buf, (b: number) => b.toString(16).padStart(2, '0')).join('');
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+      }
+      return `uuid-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+    };
+    try {
+      g.crypto.randomUUID = poly;
+    } catch {}
+  }
+})();
+
 type SettingsErrorBoundaryProps = {
   children: ReactNode;
   onReset: () => void;
@@ -401,6 +423,8 @@ export default function App() {
   const gps = statusSnapshot?.gps ?? {};
   const remoteId = statusSnapshot?.remote_id ?? {};
   const remoteIdHealth = remoteId?.health ?? {};
+  const mapsSettings = statusSnapshot?.settings?.maps ?? {};
+  const [mapsOverride, setMapsOverride] = useState<{ mode?: 'online' | 'offline' | 'auto'; offline_pack_id?: string } | null>(null);
 
   const storageFreeGb = Number(system?.storage_free_gb);
   const storageTotalGb = Number(system?.storage_total_gb);
@@ -453,7 +477,29 @@ export default function App() {
     gpsAgeSeconds,
     batteryLevel,
     networkLabel,
+    mapMode: (mapsOverride?.mode ?? mapsSettings?.mode ?? 'auto') as 'online' | 'offline' | 'auto',
+    offlinePackId: (mapsOverride?.offline_pack_id ?? mapsSettings?.offline_pack_id ?? 'asia') as string,
   };
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail || {};
+      const mode = detail.mode as 'online' | 'offline' | 'auto' | undefined;
+      const pack = detail.offline_pack_id as string | undefined;
+      setMapsOverride({ mode, offline_pack_id: pack });
+    };
+    window.addEventListener('maps-settings-changed', handler as EventListener);
+    return () => window.removeEventListener('maps-settings-changed', handler as EventListener);
+  }, []);
+
+  useEffect(() => {
+    if (!mapsOverride) return;
+    const mode = (mapsSettings?.mode ?? 'auto') as 'online' | 'offline' | 'auto';
+    const pack = (mapsSettings?.offline_pack_id ?? 'asia') as string;
+    if (mapsOverride.mode === mode && (mapsOverride.offline_pack_id ?? 'asia') === pack) {
+      setMapsOverride(null);
+    }
+  }, [mapsOverride, mapsSettings]);
 
   // Check if there are any critical alerts
   const hasCriticalAlert = mockAlerts.some(a => a.severity === 'critical' && a.status === 'active');
@@ -669,6 +715,8 @@ const handleContactClick = (contact: Contact) => {
             gpsFixQuality={statusState.gpsFixQuality}
             gpsLatitude={statusState.gpsLatitude}
             gpsLongitude={statusState.gpsLongitude}
+            mapMode={statusState.mapMode}
+            offlinePackId={statusState.offlinePackId}
           />
         </div>
         <div className={activeTab === 'alerts' ? 'block' : 'hidden'}>

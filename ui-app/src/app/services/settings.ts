@@ -45,11 +45,11 @@ export function updateAlertsSettings(payload: { preset: 'Balanced' | 'Critical F
   return requestJson('/api/v1/settings/alerts', { method: 'PUT', body: JSON.stringify(payload) });
 }
 
-export function rebootUi(dryRun = true) {
+export function rebootUi(dryRun = false) {
   return requestJson('/api/v1/system/reboot_ui', { method: 'POST', body: JSON.stringify({ confirm: true, dry_run: dryRun }) });
 }
 
-export function rebootDevice(dryRun = true) {
+export function rebootDevice(dryRun = false) {
   return requestJson('/api/v1/system/reboot_device', { method: 'POST', body: JSON.stringify({ confirm: true, dry_run: dryRun }) });
 }
 

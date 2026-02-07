@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-import json, os, time, threading, socket, subprocess, math, shutil, re, urllib.request, urllib.error, hashlib, struct
+import json, os, time, threading, socket, subprocess, math, shutil, re, urllib.request, urllib.error, hashlib, struct, sqlite3
 from pathlib import Path
 import serial
 from typing import Any, Dict, Optional, Set, List, Tuple
 from collections import deque
 
-from flask import send_from_directory, send_file, Flask, jsonify, request
+from flask import send_from_directory, send_file, Flask, jsonify, request, Response
 from flask_sock import Sock
 
 APP_PORT = 8000
@@ -45,6 +45,10 @@ MAPS_TILE_TIMEOUT_S = float(os.environ.get("NDEFENDER_GOOGLE_TILE_TIMEOUT", "8")
 MAPS_TILE_FAIL_LIMIT = int(os.environ.get("NDEFENDER_GOOGLE_TILE_FAIL_LIMIT", "50") or 50)
 PMTILES_ROOT = os.environ.get("NDEFENDER_PMTILES_DIR", "/opt/ndefender/maps/pmtiles")
 PMTILES_PACKS_DIR = os.path.join(PMTILES_ROOT, "packs")
+MBTILES_ROOT = os.environ.get("NDEFENDER_MBTILES_DIR", "/opt/ndefender/maps/mbtiles")
+MBTILES_PACK_ID = os.environ.get("NDEFENDER_MBTILES_ID", "asia")
+MBTILES_FILENAME = os.environ.get("NDEFENDER_MBTILES_FILE", f"{MBTILES_PACK_ID}.mbtiles")
+MBTILES_PATH = os.path.join(MBTILES_ROOT, MBTILES_FILENAME)
 
 RAW_JSONL_PATH = "/opt/ndefender/logs/remoteid_replay.jsonl"
 EK_JSONL_PATH  = "/opt/ndefender/logs/odid_wifi_sample.ek.jsonl"
@@ -227,8 +231,8 @@ DEFAULT_AUDIO_SETTINGS = {
     "volume": 80,
 }
 DEFAULT_MAPS_SETTINGS = {
-    "mode": "offline",
-    "offline_pack_id": "india",
+    "mode": "auto",
+    "offline_pack_id": "asia",
 }
 DEFAULT_ALERTS_SETTINGS = {
     "preset": "Balanced",
@@ -241,6 +245,17 @@ def load_settings(path: str, default: Dict[str, Any]) -> Dict[str, Any]:
     merged = default.copy()
     merged.update({k: v for k, v in data.items() if k in default})
     return merged
+
+def _normalize_maps_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    mode = str(settings.get("mode") or "auto").lower()
+    if mode not in ("online", "offline", "auto"):
+        mode = "auto"
+    pack_id = str(settings.get("offline_pack_id") or "").strip()
+    if not pack_id or pack_id == "india":
+        pack_id = MBTILES_PACK_ID
+    settings["mode"] = mode
+    settings["offline_pack_id"] = pack_id
+    return settings
 
 def save_settings(path: str, data: Dict[str, Any]) -> None:
     atomic_write_json(path, data)
@@ -256,6 +271,18 @@ def _run_cmd(cmd: List[str], extra_env: Optional[Dict[str, str]] = None) -> Tupl
         return res.returncode, output.strip()
     except Exception as e:
         return 1, str(e)
+
+def _run_nmcli(cmd: List[str]) -> Tuple[int, str]:
+    """Run nmcli with sudo -n first (for polkit), fallback to user nmcli."""
+    sudo_cmd = ["sudo", "-n"] + cmd
+    code, out = _run_cmd(sudo_cmd)
+    if code == 0:
+        return code, out
+    low = (out or "").lower()
+    if "password" in low or "no tty" in low or "sudo:" in low:
+        # sudo not allowed; fallback to user command
+        return _run_cmd(cmd)
+    return code, out
 
 def _pulse_env() -> Optional[Dict[str, str]]:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
@@ -568,6 +595,404 @@ def _start_speaker_test(duration_ms: int) -> Tuple[bool, Optional[str]]:
     t.start()
     return True, None
 
+# ---- Network (Wi-Fi + Bluetooth) ----
+def _split_nmcli_line(line: str) -> List[str]:
+    parts: List[str] = []
+    buf: List[str] = []
+    escape = False
+    for ch in line:
+        if escape:
+            buf.append(ch)
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == ":":
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+def _default_route_iface() -> Optional[str]:
+    code, out = _run_cmd(["ip", "route", "show", "default"])
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        m = re.search(r"\\bdev\\s+(\\S+)", line)
+        if m:
+            return m.group(1)
+    return None
+
+def _iface_has_ipv4(iface: str) -> bool:
+    if not iface:
+        return False
+    code, out = _run_cmd(["ip", "-4", "addr", "show", "dev", iface])
+    if code != 0:
+        return False
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            ip = line.split()[1].split("/")[0]
+            if ip and not ip.startswith("127."):
+                return True
+    return False
+
+def _list_ipv4_ifaces() -> List[str]:
+    code, out = _run_cmd(["ip", "-4", "-o", "addr", "show"])
+    if code != 0:
+        return []
+    ifaces: List[str] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            iface = parts[1]
+            if iface != "lo" and iface not in ifaces:
+                ifaces.append(iface)
+    return ifaces
+
+def _has_secondary_ipv4(default_iface: Optional[str]) -> bool:
+    for iface in _list_ipv4_ifaces():
+        if iface == default_iface:
+            continue
+        if _iface_has_ipv4(iface):
+            return True
+    return False
+
+def _wifi_guard_blocked(target_iface: Optional[str], force: bool) -> Optional[str]:
+    default_iface = _default_route_iface()
+    if default_iface != "wlan0":
+        return None
+    if target_iface and target_iface != default_iface:
+        return None
+    if force and _has_secondary_ipv4(default_iface):
+        return None
+    return "default_route_on_wlan0"
+
+def _nmcli_available() -> bool:
+    return shutil.which("nmcli") is not None
+
+def _wifi_devices() -> List[Dict[str, Any]]:
+    if not _nmcli_available():
+        return []
+    code, out = _run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "dev"])
+    if code != 0:
+        return []
+    devices: List[Dict[str, Any]] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = _split_nmcli_line(line)
+        if len(parts) < 3:
+            continue
+        devices.append({"device": parts[0], "type": parts[1], "state": parts[2]})
+    return devices
+
+def _get_wifi_iface(preferred: Optional[str] = None) -> Optional[str]:
+    if preferred:
+        return preferred
+    for dev in _wifi_devices():
+        if dev.get("type") == "wifi":
+            return dev.get("device")
+    return None
+
+def _get_wifi_enabled() -> Optional[bool]:
+    if not _nmcli_available():
+        return None
+    code, out = _run_cmd(["nmcli", "-t", "-f", "WIFI", "general"])
+    if code != 0:
+        return None
+    val = out.strip().lower()
+    if val.startswith("enabled"):
+        return True
+    if val.startswith("disabled"):
+        return False
+    return None
+
+def _get_wifi_active() -> Dict[str, Any]:
+    if not _nmcli_available():
+        return {}
+    code, out = _run_cmd(["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,FREQ,DEVICE", "dev", "wifi"])
+    if code == 0:
+        for line in out.splitlines():
+            parts = _split_nmcli_line(line)
+            if not parts:
+                continue
+            in_use = parts[0] == "*"
+            if not in_use:
+                continue
+            ssid = parts[1] if len(parts) > 1 else ""
+            signal = _to_int(parts[2]) if len(parts) > 2 else None
+            freq = _to_int(parts[3]) if len(parts) > 3 else None
+            device = parts[4] if len(parts) > 4 else None
+            return {"ssid": ssid, "signal": signal, "freq": freq, "device": device}
+    # fallback to active connections
+    code, out = _run_cmd(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+    if code == 0:
+        for line in out.splitlines():
+            parts = _split_nmcli_line(line)
+            if len(parts) < 3:
+                continue
+            if parts[1] in ("wifi", "802-11-wireless"):
+                return {"ssid": parts[0], "device": parts[2]}
+    return {}
+
+def _iface_ipv4(iface: Optional[str]) -> Optional[str]:
+    if not iface:
+        return None
+    code, out = _run_cmd(["ip", "-4", "addr", "show", "dev", iface])
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            return line.split()[1].split("/")[0]
+    return None
+
+def _iface_mac(iface: Optional[str]) -> Optional[str]:
+    if not iface:
+        return None
+    code, out = _run_cmd(["ip", "link", "show", "dev", iface])
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("link/"):
+            parts = line.split()
+            if len(parts) >= 2:
+                return parts[1]
+    return None
+
+def _get_saved_wifi_ssids() -> List[str]:
+    if not _nmcli_available():
+        return []
+    code, out = _run_cmd(["nmcli", "-t", "-f", "NAME,TYPE,802-11-wireless.ssid", "connection", "show"])
+    if code != 0:
+        return []
+    ssids: List[str] = []
+    for line in out.splitlines():
+        parts = _split_nmcli_line(line)
+        if len(parts) < 2:
+            continue
+        if parts[1] not in ("wifi", "802-11-wireless"):
+            continue
+        ssid = parts[2] if len(parts) > 2 and parts[2] else parts[0]
+        if ssid and ssid not in ssids:
+            ssids.append(ssid)
+    return ssids
+
+def _scan_wifi_networks(iface: Optional[str] = None) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    if not _nmcli_available():
+        return None, "nmcli_not_found"
+    if not iface:
+        active = _get_wifi_active()
+        iface = active.get("device") or _get_wifi_iface()
+    # Attempt a privileged rescan if available to keep results fresh.
+    # This avoids stale cache when NetworkManager can't rescan as an unprivileged user.
+    if iface:
+        _run_cmd(["sudo", "-n", "nmcli", "dev", "wifi", "rescan", "ifname", iface])
+    else:
+        _run_cmd(["sudo", "-n", "nmcli", "dev", "wifi", "rescan"])
+    cmd = ["nmcli", "-t", "-f", "IN-USE,SSID,SECURITY,SIGNAL,FREQ", "dev", "wifi", "list"]
+    if iface:
+        cmd += ["ifname", iface]
+    # Prefer active rescan if supported.
+    cmd_with_rescan = cmd + ["--rescan", "yes"]
+    code, out = _run_cmd(cmd_with_rescan)
+    if code != 0:
+        # Fallback to no-rescan (older nmcli)
+        code, out = _run_cmd(cmd)
+        if code != 0:
+            return None, "nmcli_scan_failed"
+    saved = set(_get_saved_wifi_ssids())
+    networks: List[Dict[str, Any]] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = _split_nmcli_line(line)
+        in_use = parts[0] == "*" if parts else False
+        ssid = parts[1] if len(parts) > 1 else ""
+        if ssid == "":
+            ssid = "<hidden>"
+        security = parts[2] if len(parts) > 2 else ""
+        signal = _to_int(parts[3]) if len(parts) > 3 else None
+        freq_raw = parts[4] if len(parts) > 4 else ""
+        freq = _to_int(freq_raw)
+        if freq is None and freq_raw:
+            m = re.search(r"(\d+)", str(freq_raw))
+            if m:
+                freq = _to_int(m.group(1))
+        networks.append({
+            "ssid": ssid,
+            "security": security,
+            "signal": signal if signal is not None else 0,
+            "freq": freq,
+            "saved": ssid in saved,
+            "in_use": in_use,
+        })
+    return networks, None
+
+def _network_status_snapshot() -> Dict[str, Any]:
+    default_iface = _default_route_iface()
+    wifi_enabled = _get_wifi_enabled()
+    active = _get_wifi_active()
+    iface = active.get("device") or default_iface or _get_wifi_iface()
+    return {
+        "wifi": {
+            "enabled": wifi_enabled,
+            "connected": bool(active.get("ssid")),
+            "ssid": active.get("ssid"),
+            "signal": active.get("signal"),
+            "freq": active.get("freq"),
+            "iface": iface,
+            "ip": _iface_ipv4(iface),
+            "mac": _iface_mac(iface),
+            "default_route_iface": default_iface,
+        },
+        "timestamp_ms": now_ms(),
+    }
+
+def _btctl_available() -> bool:
+    return shutil.which("bluetoothctl") is not None
+
+def _btctl_cmd(args: List[str]) -> Tuple[int, str]:
+    return _run_cmd(["bluetoothctl"] + args)
+
+def _btctl_script(lines: List[str]) -> Tuple[int, str]:
+    try:
+        payload = "\n".join(lines + ["quit", ""])  # ensure newline
+        res = subprocess.run(
+            ["bluetoothctl"],
+            input=payload,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        output = (res.stdout or "") + (res.stderr or "")
+        return res.returncode, output.strip()
+    except Exception as e:
+        return 1, str(e)
+
+def _btctl_pair(mac: str) -> Tuple[int, str]:
+    # Prime scan to ensure device appears.
+    _btctl_script(["scan on"])
+    time.sleep(3)
+    _btctl_script(["scan off"])
+    # Use scripted agent to avoid "Failed to register agent object".
+    code, out = _btctl_script(["agent on", "default-agent", f"pair {mac}", f"trust {mac}"])
+    if code == 0 and "Failed" not in out and "not available" not in out.lower():
+        if _wait_for_paired(mac):
+            return code, out
+    # Fallback to direct pair with timeout (no agent flag).
+    timeout_bin = shutil.which("timeout")
+    base_cmd = ["bluetoothctl", "--timeout", "20", "pair", mac]
+    cmd = [timeout_bin, "25s"] + base_cmd if timeout_bin else base_cmd
+    code, out = _run_cmd(cmd)
+    if code == 0 and "Failed" not in out and "not available" not in out.lower():
+        _run_cmd(["bluetoothctl", "trust", mac])
+        if _wait_for_paired(mac):
+            return code, out
+    if _wait_for_paired(mac, timeout_s=2.0):
+        return code, out
+    return 1, (out + "\nnot_paired").strip()
+
+def _btctl_parse_devices(out: str) -> List[Dict[str, str]]:
+    devices: List[Dict[str, str]] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("Device "):
+            continue
+        parts = line.split(" ", 2)
+        if len(parts) < 3:
+            continue
+        devices.append({"mac": parts[1], "name": parts[2]})
+    return devices
+
+def _btctl_is_connected(mac: str) -> bool:
+    if not mac:
+        return False
+    code, out = _btctl_cmd(["info", mac])
+    if code != 0:
+        return False
+    for line in out.splitlines():
+        if "Connected:" in line:
+            return "yes" in line.lower()
+    return False
+
+def _btctl_is_paired(mac: str) -> bool:
+    if not mac:
+        return False
+    code, out = _btctl_cmd(["info", mac])
+    if code != 0:
+        return False
+    for line in out.splitlines():
+        if "Paired:" in line:
+            return "yes" in line.lower()
+    return False
+
+def _wait_for_paired(mac: str, timeout_s: float = 5.0) -> bool:
+    end = time.time() + timeout_s
+    while time.time() < end:
+        if _btctl_is_paired(mac):
+            return True
+        time.sleep(0.5)
+    return False
+
+def _bt_status_snapshot() -> Dict[str, Any]:
+    powered = None
+    discovering = None
+    discoverable = None
+    if _btctl_available():
+        code, out = _btctl_cmd(["show"])
+        if code == 0:
+            for line in out.splitlines():
+                if "Powered:" in line:
+                    powered = "yes" in line.lower()
+                if "Discovering:" in line:
+                    discovering = "yes" in line.lower()
+                if "Discoverable:" in line:
+                    discoverable = "yes" in line.lower()
+    paired: List[Dict[str, Any]] = []
+    connected: List[Dict[str, Any]] = []
+    discovered: List[Dict[str, Any]] = []
+    if _btctl_available():
+        code, out = _btctl_cmd(["devices", "Paired"])
+        if code == 0:
+            paired = _btctl_parse_devices(out)
+        code, out = _btctl_cmd(["devices"])
+        if code == 0:
+            discovered = _btctl_parse_devices(out)
+        for dev in paired:
+            if _btctl_is_connected(dev.get("mac") or ""):
+                connected.append(dev)
+    return {
+        "bluetooth": {
+            "enabled": powered,
+            "discovering": discovering,
+            "discoverable": discoverable,
+            "paired_devices": paired,
+            "connected_devices": connected,
+            "discovered_devices": discovered,
+        },
+        "timestamp_ms": now_ms(),
+    }
+
+def _emit_network_update(extra: Optional[Dict[str, Any]] = None) -> None:
+    payload = {}
+    payload.update(_network_status_snapshot())
+    try:
+        payload.update(_bt_status_snapshot())
+    except Exception:
+        pass
+    if extra:
+        payload.update(extra)
+    try:
+        ws_broadcast(_ws_env("NETWORK_UPDATE", "backend", payload))
+    except Exception:
+        pass
+
 # ---- Offline Map Packs ----
 _MAP_PACKS_LOCK = threading.Lock()
 _MAP_DOWNLOADS: Dict[str, threading.Thread] = {}
@@ -606,6 +1031,113 @@ def _pmtiles_pack_info() -> Tuple[bool, int, Optional[int]]:
     except Exception:
         pass
     return False, 0, None
+
+def _ensure_mbtiles_dir() -> None:
+    try:
+        os.makedirs(MBTILES_ROOT, exist_ok=True)
+    except Exception:
+        pass
+
+def _mbtiles_exists() -> bool:
+    try:
+        return os.path.isfile(MBTILES_PATH) and os.path.getsize(MBTILES_PATH) > 0
+    except Exception:
+        return False
+
+def _mbtiles_metadata() -> Dict[str, str]:
+    if not _mbtiles_exists():
+        return {}
+    try:
+        conn = sqlite3.connect(MBTILES_PATH)
+        cur = conn.execute("SELECT name, value FROM metadata")
+        meta = {row[0]: row[1] for row in cur.fetchall() if row and len(row) >= 2}
+        conn.close()
+        return meta
+    except Exception:
+        return {}
+
+def _mbtiles_status() -> Dict[str, Any]:
+    _ensure_mbtiles_dir()
+    meta = _mbtiles_metadata()
+    size = 0
+    updated_ts = None
+    try:
+        if os.path.isfile(MBTILES_PATH):
+            size = int(os.path.getsize(MBTILES_PATH))
+            updated_ts = int(os.path.getmtime(MBTILES_PATH) * 1000)
+    except Exception:
+        pass
+    bounds = None
+    center = None
+    minzoom = None
+    maxzoom = None
+    if meta.get("bounds"):
+        try:
+            parts = [float(p) for p in meta["bounds"].split(",")]
+            if len(parts) == 4:
+                bounds = parts
+        except Exception:
+            bounds = None
+    if meta.get("center"):
+        try:
+            parts = [float(p) for p in meta["center"].split(",")]
+            if len(parts) >= 2:
+                center = parts[:3]
+        except Exception:
+            center = None
+    try:
+        if meta.get("minzoom") is not None:
+            minzoom = int(float(meta.get("minzoom")))
+    except Exception:
+        minzoom = None
+    try:
+        if meta.get("maxzoom") is not None:
+            maxzoom = int(float(meta.get("maxzoom")))
+    except Exception:
+        maxzoom = None
+    return {
+        "exists": _mbtiles_exists(),
+        "path": MBTILES_PATH,
+        "bytes": size,
+        "updated_ts": updated_ts,
+        "metadata": meta,
+        "bounds": bounds,
+        "center": center,
+        "minzoom": minzoom,
+        "maxzoom": maxzoom,
+    }
+
+def _mbtiles_get_tile(z: int, x: int, y: int) -> Optional[bytes]:
+    if not _mbtiles_exists():
+        return None
+    try:
+        tms_y = (1 << z) - 1 - y
+        conn = sqlite3.connect(MBTILES_PATH)
+        cur = conn.execute(
+            "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+            (z, x, tms_y),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None
+        data = row[0]
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        return data
+    except Exception:
+        return None
+
+def _guess_tile_mime(data: bytes) -> str:
+    if not data:
+        return "application/octet-stream"
+    if data.startswith(b"\x89PNG"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if data.startswith(b"GIF8"):
+        return "image/gif"
+    return "application/octet-stream"
 
 def _load_map_packs() -> Dict[str, Any]:
     data = safe_load(MAPS_PACKS_STATE_FILE, {"packs": {}})
@@ -2246,6 +2778,12 @@ def to_status_snapshot_v1(v0: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
+    maps_settings = load_settings(MAPS_SETTINGS_FILE, DEFAULT_MAPS_SETTINGS)
+    maps_settings = _normalize_maps_settings(maps_settings)
+    try:
+        save_settings(MAPS_SETTINGS_FILE, maps_settings)
+    except Exception:
+        pass
     snap = {
         "timestamp": ts_ms,
         "overall_ok": bool(v0.get("ok")),
@@ -2260,7 +2798,7 @@ def to_status_snapshot_v1(v0: Dict[str, Any]) -> Dict[str, Any]:
         "settings": {
             "ui": load_settings(UI_SETTINGS_FILE, DEFAULT_UI_SETTINGS),
             "audio": load_settings(AUDIO_SETTINGS_FILE, DEFAULT_AUDIO_SETTINGS),
-            "maps": load_settings(MAPS_SETTINGS_FILE, DEFAULT_MAPS_SETTINGS),
+            "maps": maps_settings,
             "alerts": load_settings(ALERTS_SETTINGS_FILE, DEFAULT_ALERTS_SETTINGS),
         },
         "esp32": (lambda: (CTRL_STATE.copy()) if "CTRL_STATE" in globals() else {"status":"DISCONNECTED","rssi_dbm":None,"uptime_seconds":None})(),
@@ -2487,10 +3025,281 @@ def api_audio_asset_wav(name: str):
         return jsonify({"ok": False, "error": "stat_failed"}), 404
     return send_file(path, mimetype="audio/wav", conditional=True)
 
+# ---- Network API ----
+@app.get("/api/v1/network/status")
+def api_network_status():
+    if not _nmcli_available():
+        return jsonify({"ok": False, "error": "nmcli_not_found"}), 501
+    payload = _network_status_snapshot()
+    try:
+        payload.update(_bt_status_snapshot())
+    except Exception:
+        pass
+    payload["ok"] = True
+    return jsonify(payload)
+
+@app.post("/api/v1/network/wifi/scan")
+def api_network_wifi_scan():
+    if not _nmcli_available():
+        return jsonify({"ok": False, "error": "nmcli_not_found"}), 501
+    payload = _json_body()
+    iface = payload.get("iface")
+    networks, err = _scan_wifi_networks(str(iface).strip() if iface else None)
+    if err:
+        return jsonify({"ok": False, "error": err}), 500
+    resp = {"ok": True, "networks": networks or [], "timestamp_ms": now_ms()}
+    _emit_network_update({"wifi_scan": resp})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/wifi/connect")
+def api_network_wifi_connect():
+    if not _nmcli_available():
+        return jsonify({"ok": False, "error": "nmcli_not_found"}), 501
+    payload = _json_body()
+    ssid = str(payload.get("ssid") or "").strip()
+    if not ssid:
+        return jsonify({"ok": False, "error": "missing_ssid"}), 400
+    iface = str(payload.get("iface") or "").strip() or _get_wifi_iface()
+    force = _parse_bool(payload.get("force")) or False
+    blocked = _wifi_guard_blocked(iface, force)
+    if blocked:
+        return jsonify({
+            "ok": False,
+            "error": "ssh_guard",
+            "detail": "default route on wlan0; add force=true with a secondary interface online",
+            "default_route_iface": _default_route_iface(),
+        }), 409
+
+    password = payload.get("password")
+    if ssid == "<hidden>":
+        return jsonify({"ok": False, "error": "hidden_ssid"}), 400
+    cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+    if password:
+        cmd += ["password", str(password)]
+    if iface:
+        cmd += ["ifname", iface]
+    code, out = _run_nmcli(cmd)
+    if code != 0:
+        low = (out or "").lower()
+        if "secrets" in low and "not provided" in low:
+            return jsonify({"ok": False, "error": "missing_password"}), 400
+        return jsonify({"ok": False, "error": "nmcli_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "ssid": ssid, "iface": iface, "timestamp_ms": now_ms()}
+    _emit_network_update({"wifi_action": "connect"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/wifi/disconnect")
+def api_network_wifi_disconnect():
+    if not _nmcli_available():
+        return jsonify({"ok": False, "error": "nmcli_not_found"}), 501
+    payload = _json_body()
+    iface = str(payload.get("iface") or "").strip() or _get_wifi_iface()
+    if not iface:
+        return jsonify({"ok": False, "error": "no_wifi_iface"}), 500
+    force = _parse_bool(payload.get("force")) or False
+    blocked = _wifi_guard_blocked(iface, force)
+    if blocked:
+        return jsonify({
+            "ok": False,
+            "error": "ssh_guard",
+            "detail": "default route on wlan0; add force=true with a secondary interface online",
+            "default_route_iface": _default_route_iface(),
+        }), 409
+    code, out = _run_nmcli(["nmcli", "dev", "disconnect", iface])
+    if code != 0:
+        return jsonify({"ok": False, "error": "nmcli_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "iface": iface, "timestamp_ms": now_ms()}
+    _emit_network_update({"wifi_action": "disconnect"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/wifi/forget")
+def api_network_wifi_forget():
+    if not _nmcli_available():
+        return jsonify({"ok": False, "error": "nmcli_not_found"}), 501
+    payload = _json_body()
+    ssid = str(payload.get("ssid") or "").strip()
+    if not ssid:
+        return jsonify({"ok": False, "error": "missing_ssid"}), 400
+    force = _parse_bool(payload.get("force")) or False
+    blocked = _wifi_guard_blocked(None, force)
+    if blocked:
+        return jsonify({
+            "ok": False,
+            "error": "ssh_guard",
+            "detail": "default route on wlan0; add force=true with a secondary interface online",
+            "default_route_iface": _default_route_iface(),
+        }), 409
+    code, out = _run_nmcli(["nmcli", "-t", "-f", "NAME,TYPE,802-11-wireless.ssid", "connection", "show"])
+    if code != 0:
+        return jsonify({"ok": False, "error": "nmcli_failed"}), 500
+    targets: List[str] = []
+    for line in out.splitlines():
+        parts = _split_nmcli_line(line)
+        if len(parts) < 2:
+            continue
+        if parts[1] not in ("wifi", "802-11-wireless"):
+            continue
+        candidate = parts[2] if len(parts) > 2 and parts[2] else parts[0]
+        if candidate == ssid:
+            targets.append(parts[0])
+    if not targets:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    for name in targets:
+        _run_nmcli(["nmcli", "connection", "delete", name])
+    resp = {"ok": True, "ssid": ssid, "timestamp_ms": now_ms()}
+    _emit_network_update({"wifi_action": "forget"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/wifi/radio")
+def api_network_wifi_radio():
+    if not _nmcli_available():
+        return jsonify({"ok": False, "error": "nmcli_not_found"}), 501
+    payload = _json_body()
+    enabled = _parse_bool(payload.get("enabled"))
+    if enabled is None:
+        return jsonify({"ok": False, "error": "invalid_enabled"}), 400
+    force = _parse_bool(payload.get("force")) or False
+    iface = _get_wifi_iface()
+    if not enabled:
+        blocked = _wifi_guard_blocked(iface, force)
+        if blocked:
+            return jsonify({
+                "ok": False,
+                "error": "ssh_guard",
+                "detail": "default route on wlan0; add force=true with a secondary interface online",
+                "default_route_iface": _default_route_iface(),
+            }), 409
+    code, out = _run_nmcli(["nmcli", "radio", "wifi", "on" if enabled else "off"])
+    if code != 0:
+        return jsonify({"ok": False, "error": "nmcli_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "enabled": enabled, "timestamp_ms": now_ms()}
+    _emit_network_update({"wifi_action": "radio"})
+    return jsonify(resp)
+
+@app.get("/api/v1/network/bt/status")
+def api_network_bt_status():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    payload = _bt_status_snapshot()
+    payload["ok"] = True
+    return jsonify(payload)
+
+@app.post("/api/v1/network/bt/scan/start")
+def api_network_bt_scan_start():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    code, out = _btctl_script(["scan on"])
+    if code != 0:
+        return jsonify({"ok": False, "error": "scan_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "timestamp_ms": now_ms()}
+    _emit_network_update({"bt_action": "scan_start"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/bt/scan/stop")
+def api_network_bt_scan_stop():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    code, out = _btctl_script(["scan off"])
+    if code != 0:
+        return jsonify({"ok": False, "error": "scan_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "timestamp_ms": now_ms()}
+    _emit_network_update({"bt_action": "scan_stop"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/bt/pair")
+def api_network_bt_pair():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    payload = _json_body()
+    mac = str(payload.get("mac") or "").strip()
+    if not mac:
+        return jsonify({"ok": False, "error": "missing_mac"}), 400
+    code, out = _btctl_pair(mac)
+    if code != 0 or "Failed" in out or "not available" in out.lower() or "no agent" in out.lower():
+        return jsonify({"ok": False, "error": "pair_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "mac": mac, "timestamp_ms": now_ms()}
+    _emit_network_update({"bt_action": "pair"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/bt/connect")
+def api_network_bt_connect():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    payload = _json_body()
+    mac = str(payload.get("mac") or "").strip()
+    if not mac:
+        return jsonify({"ok": False, "error": "missing_mac"}), 400
+    code, out = _btctl_script(["agent on", "default-agent", f"connect {mac}"])
+    if code != 0 or "Failed" in out:
+        return jsonify({"ok": False, "error": "connect_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "mac": mac, "timestamp_ms": now_ms()}
+    _emit_network_update({"bt_action": "connect"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/bt/disconnect")
+def api_network_bt_disconnect():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    payload = _json_body()
+    mac = str(payload.get("mac") or "").strip()
+    if not mac:
+        return jsonify({"ok": False, "error": "missing_mac"}), 400
+    code, out = _btctl_script([f"disconnect {mac}"])
+    if code != 0 or "Failed" in out:
+        return jsonify({"ok": False, "error": "disconnect_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "mac": mac, "timestamp_ms": now_ms()}
+    _emit_network_update({"bt_action": "disconnect"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/bt/unpair")
+def api_network_bt_unpair():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    payload = _json_body()
+    mac = str(payload.get("mac") or "").strip()
+    if not mac:
+        return jsonify({"ok": False, "error": "missing_mac"}), 400
+    code, out = _btctl_script([f"remove {mac}"])
+    if code != 0 or "Failed" in out:
+        return jsonify({"ok": False, "error": "unpair_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "mac": mac, "timestamp_ms": now_ms()}
+    _emit_network_update({"bt_action": "unpair"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/bt/power")
+def api_network_bt_power():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    payload = _json_body()
+    enabled = _parse_bool(payload.get("enabled"))
+    if enabled is None:
+        return jsonify({"ok": False, "error": "invalid_enabled"}), 400
+    code, out = _btctl_cmd(["power", "on" if enabled else "off"])
+    if code != 0 or "Failed" in out:
+        return jsonify({"ok": False, "error": "power_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "enabled": enabled, "timestamp_ms": now_ms()}
+    _emit_network_update({"bt_action": "power"})
+    return jsonify(resp)
+
+@app.post("/api/v1/network/bt/discoverable")
+def api_network_bt_discoverable():
+    if not _btctl_available():
+        return jsonify({"ok": False, "error": "bluetoothctl_not_found"}), 501
+    payload = _json_body()
+    enabled = _parse_bool(payload.get("enabled"))
+    if enabled is None:
+        return jsonify({"ok": False, "error": "invalid_enabled"}), 400
+    code, out = _btctl_cmd(["discoverable", "on" if enabled else "off"])
+    if code != 0 or "Failed" in out:
+        return jsonify({"ok": False, "error": "discoverable_failed", "detail": out[:240]}), 500
+    resp = {"ok": True, "enabled": enabled, "timestamp_ms": now_ms()}
+    _emit_network_update({"bt_action": "discoverable"})
+    return jsonify(resp)
+
 @app.route("/api/v1/settings/maps", methods=["PUT"])
 def api_settings_maps():
     payload = _json_body()
-    settings = load_settings(MAPS_SETTINGS_FILE, DEFAULT_MAPS_SETTINGS)
+    settings = _normalize_maps_settings(load_settings(MAPS_SETTINGS_FILE, DEFAULT_MAPS_SETTINGS))
     mode = payload.get("mode")
     if mode is not None:
         mode = str(mode).lower()
@@ -2500,6 +3309,7 @@ def api_settings_maps():
     if "offline_pack_id" in payload:
         val = payload.get("offline_pack_id")
         settings["offline_pack_id"] = (str(val).strip() or None) if val is not None else None
+    settings = _normalize_maps_settings(settings)
     save_settings(MAPS_SETTINGS_FILE, settings)
     return jsonify({"ok": True, "settings": settings})
 
@@ -2525,7 +3335,10 @@ def api_reboot_ui():
         return jsonify({"ok": False, "error": "confirm_required"}), 400
     if dry_run:
         return jsonify({"ok": True, "dry_run": True})
-    return _not_supported("reboot disabled in this build")
+    code, out = _run_cmd(["sudo", "-n", "systemctl", "restart", "ndefender-kiosk"])
+    if code != 0:
+        return jsonify({"ok": False, "error": "restart_failed", "detail": out[:240]}), 500
+    return jsonify({"ok": True})
 
 @app.route("/api/v1/system/reboot_device", methods=["POST"])
 def api_reboot_device():
@@ -2536,7 +3349,10 @@ def api_reboot_device():
         return jsonify({"ok": False, "error": "confirm_required"}), 400
     if dry_run:
         return jsonify({"ok": True, "dry_run": True})
-    return _not_supported("reboot disabled in this build")
+    code, out = _run_cmd(["sudo", "-n", "systemctl", "reboot"])
+    if code != 0:
+        return jsonify({"ok": False, "error": "reboot_failed", "detail": out[:240]}), 500
+    return jsonify({"ok": True})
 
 @app.route("/api/v1/system/buzzer_test", methods=["POST"])
 def api_buzzer_test():
@@ -2624,6 +3440,30 @@ def api_maps_packs():
 
 @app.get("/api/v1/maps/packs/<pack_id>/status")
 def api_maps_pack_status(pack_id: str):
+    if pack_id == MBTILES_PACK_ID:
+        status = _mbtiles_status()
+        if not status.get("exists"):
+            return jsonify({"ok": False, "error": "not_found"}), 404
+        bounds = status.get("bounds")
+        center = status.get("center")
+        meta = status.get("metadata") or {}
+        pack = {
+            "id": MBTILES_PACK_ID,
+            "name": meta.get("name") or MBTILES_PACK_ID,
+            "bbox": {
+                "west": bounds[0],
+                "south": bounds[1],
+                "east": bounds[2],
+                "north": bounds[3],
+            } if bounds and len(bounds) == 4 else None,
+            "zmin": status.get("minzoom"),
+            "zmax": status.get("maxzoom"),
+            "status": "ready",
+            "bytes": status.get("bytes"),
+            "updated_ts": status.get("updated_ts"),
+            "center": center,
+        }
+        return jsonify({"ok": True, "pack": pack})
     with _MAP_PACKS_LOCK:
         data = _load_map_packs()
         pack = (data.get("packs") or {}).get(pack_id)
@@ -2728,6 +3568,25 @@ def api_pmtiles_serve(pack_id: str):
         return jsonify({"ok": False, "error": "not_found"}), 404
     return send_from_directory(PMTILES_PACKS_DIR, f"{PMTILES_PACK_ID}.pmtiles")
 
+@app.get("/api/v1/maps/mbtiles/status")
+def api_mbtiles_status():
+    status = _mbtiles_status()
+    status["ok"] = True
+    status["id"] = MBTILES_PACK_ID
+    return jsonify(status)
+
+@app.get("/mbtiles/<pack_id>/<int:z>/<int:x>/<int:y>.<ext>")
+def api_mbtiles_tile(pack_id: str, z: int, x: int, y: int, ext: str):
+    if pack_id != MBTILES_PACK_ID:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    data = _mbtiles_get_tile(z, x, y)
+    if not data:
+        return jsonify({"ok": False, "error": "tile_not_found"}), 404
+    mime = _guess_tile_mime(data)
+    resp = Response(data, mimetype=mime)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
 @app.route("/api/v1/maps/packs/<pack_id>/delete", methods=["POST"])
 def api_maps_pack_delete(pack_id: str):
     with _MAP_PACKS_LOCK:
@@ -2768,6 +3627,11 @@ def api_maps_pack_redownload(pack_id: str):
 
 @app.get("/tiles/<pack_id>/<int:z>/<int:x>/<int:y>.png")
 def api_map_tile(pack_id: str, z: int, x: int, y: int):
+    if pack_id == MBTILES_PACK_ID:
+        data = _mbtiles_get_tile(z, x, y)
+        if not data:
+            return ("", 404)
+        return Response(data, mimetype=_guess_tile_mime(data))
     tile_file = _tile_path(pack_id, z, x, y)
     if not os.path.exists(tile_file):
         return ("", 404)

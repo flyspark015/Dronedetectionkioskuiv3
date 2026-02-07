@@ -8,7 +8,6 @@ import { MapToolStack } from './MapToolStack';
 import { CompassControl } from './CompassControl';
 import { FullscreenMapBar } from './FullscreenMapBar';
 import type { Contact } from '@/app/types/contacts';
-import { getPmtilesPacks } from '@/app/services/settings';
 
 interface HomeScreenProps {
   contacts: Contact[];
@@ -19,6 +18,8 @@ interface HomeScreenProps {
   gpsFixQuality?: number;
   gpsLatitude?: number | null;
   gpsLongitude?: number | null;
+  mapMode?: 'online' | 'offline' | 'auto';
+  offlinePackId?: string | null;
 }
 
 export function HomeScreen({
@@ -30,17 +31,17 @@ export function HomeScreen({
   gpsFixQuality = 2,
   gpsLatitude,
   gpsLongitude,
+  mapMode,
+  offlinePackId,
 }: HomeScreenProps) {
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
   const [drawerSnap, setDrawerSnap] = useState<'collapsed' | 'mid' | 'expanded'>('mid');
   const [isFullscreenMap, setIsFullscreenMap] = useState(false);
   const [mapHeading, setMapHeading] = useState(0);
   const [zoom, setZoom] = useState(14);
-  const [pmtilesReady, setPmtilesReady] = useState(false);
-
   // Count Remote ID contacts for map markers
   const remoteIdCount = contacts.filter(c => c.type === 'REMOTE_ID').length;
-  const activePackId = pmtilesReady ? 'india' : null;
+  const activePackId = offlinePackId ?? null;
 
   // Mock telemetry and GPS data
   const telemetryAge = 2;
@@ -53,25 +54,7 @@ export function HomeScreen({
     }
   }, [isFullscreenMap]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadPmtilesStatus = async () => {
-      const res = await getPmtilesPacks();
-      if (cancelled) return;
-      if (res.ok) {
-        const pack = Array.isArray(res.data?.packs) ? res.data.packs[0] : null;
-        const installed = Boolean(pack?.installed);
-        const bytes = Number(pack?.bytes ?? 0);
-        setPmtilesReady(installed && bytes > 0);
-        return;
-      }
-      setPmtilesReady(false);
-    };
-    loadPmtilesStatus();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const effectiveMapMode = mapMode ?? 'auto';
 
   const handleDrawerSnapChange = (snap: 'collapsed' | 'mid' | 'expanded') => {
     setDrawerSnap(snap);
@@ -155,7 +138,7 @@ export function HomeScreen({
             gpsLatitude={gpsLatitude ?? null}
             gpsLongitude={gpsLongitude ?? null}
             focusContact={selectedContact}
-            mapMode="online"
+            mapMode={effectiveMapMode}
             offlinePackId={activePackId}
           />
         </div>

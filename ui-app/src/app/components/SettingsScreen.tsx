@@ -4,9 +4,11 @@ import { Chip } from './Chip';
 import { Button } from './Button';
 import { HoldButton } from './HoldButton';
 import { RfScanSettings } from './antsdr/RfScanSettings';
-import { Activity, Wifi, Bell, Video, Code, Volume2, Power, RotateCcw, Map, Radio, ChevronRight } from 'lucide-react';
+import { NetworkSettings } from './NetworkSettings';
+import { Activity, Wifi, Bell, Video, Code, Volume2, Power, RotateCcw, Map, Radio, ChevronRight, ChevronLeft } from 'lucide-react';
 import {
   updateAlertsSettings,
+  updateMapsSettings,
   rebootUi,
   rebootDevice,
   buzzerTest,
@@ -139,6 +141,7 @@ export function SettingsScreen({
   const [buzzerBusy, setBuzzerBusy] = useState(false);
   const [alertPreset, setAlertPreset] = useState<'Balanced' | 'Critical Focus' | 'Training'>('Balanced');
   const [showRfSettings, setShowRfSettings] = useState(false);
+  const [activeGroup, setActiveGroup] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const initRef = useRef(false);
 
@@ -146,13 +149,19 @@ export function SettingsScreen({
   const [alertsSaveState, setAlertsSaveState] = useSaveState();
   const [systemSaveState, setSystemSaveState] = useSaveState();
   const [videoSaveState, setVideoSaveState] = useSaveState();
+  const [mapsSaveState, setMapsSaveState] = useSaveState();
   const [pmtilesReady, setPmtilesReady] = useState(false);
   const [pmtilesSizeBytes, setPmtilesSizeBytes] = useState<number | null>(null);
+  const [mapMode, setMapMode] = useState<'online' | 'offline' | 'auto'>('auto');
+  const [offlinePackId, setOfflinePackId] = useState<string>('asia');
+  const [mbtilesReady, setMbtilesReady] = useState<boolean>(false);
+  const [mbtilesBytes, setMbtilesBytes] = useState<number | null>(null);
 
   const audioPendingRef = useRef(false);
   const systemVolumeInitRef = useRef(false);
   const alertsPendingRef = useRef(false);
   const systemPendingRef = useRef(false);
+  const mapsPendingRef = useRef(false);
   const audioQueuedRef = useRef<Partial<{ volume: number }> | null>(null);
   const pmtilesInitRef = useRef(false);
 
@@ -166,14 +175,18 @@ export function SettingsScreen({
   const settings = statusSnapshot?.settings ?? {};
   const audioSettings = settings?.audio ?? {};
   const alertsSettings = settings?.alerts ?? {};
+  const mapsSettings = settings?.maps ?? {};
 
   useEffect(() => {
     if (initRef.current) return;
     if (!statusSnapshot?.settings) return;
     if (audioSettings?.volume != null && !systemVolumeInitRef.current) setAudioVolume(Number(audioSettings.volume));
     if (alertsSettings?.preset) setAlertPreset(alertsSettings.preset as any);
+    if (mapsSettings?.mode) setMapMode(mapsSettings.mode as any);
+    const pack = String(mapsSettings?.offline_pack_id || '').trim();
+    setOfflinePackId(pack && pack !== 'india' ? pack : 'asia');
     initRef.current = true;
-  }, [statusSnapshot, audioSettings, alertsSettings]);
+  }, [statusSnapshot, audioSettings, alertsSettings, mapsSettings]);
 
   useEffect(() => {
     let cancelled = false;
@@ -215,6 +228,27 @@ export function SettingsScreen({
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    const loadMbtilesStatus = async () => {
+      try {
+        const res = await fetch('/api/v1/maps/mbtiles/status', { cache: 'no-store' });
+        const data = await res.json().catch(() => null);
+        if (cancelled) return;
+        if (res.ok && data?.ok) {
+          setMbtilesReady(Boolean(data.exists));
+          setMbtilesBytes(Number(data.bytes ?? 0));
+        }
+      } catch {
+        // ignore
+      }
+    };
+    loadMbtilesStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     fetch('/api/v1/ui/debug/settings', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -227,7 +261,7 @@ export function SettingsScreen({
     if (systemPendingRef.current) return;
     systemPendingRef.current = true;
     setSystemSaveState('saving');
-    const res = await rebootUi(true);
+    const res = await rebootUi(false);
     setSystemSaveState(res.ok ? 'saved' : (res.error === 'not supported in this build' ? 'unsupported' : 'error'));
     systemPendingRef.current = false;
   };
@@ -236,7 +270,7 @@ export function SettingsScreen({
     if (systemPendingRef.current) return;
     systemPendingRef.current = true;
     setSystemSaveState('saving');
-    const res = await rebootDevice(true);
+    const res = await rebootDevice(false);
     setSystemSaveState(res.ok ? 'saved' : (res.error === 'not supported in this build' ? 'unsupported' : 'error'));
     systemPendingRef.current = false;
   };
@@ -305,6 +339,8 @@ export function SettingsScreen({
 
   const pmtilesStatusLabel = pmtilesReady ? 'Offline map ready' : 'Offline map missing';
   const pmtilesSizeLabel = pmtilesReady && pmtilesSizeBytes != null ? formatBytes(pmtilesSizeBytes) : '—';
+  const mbtilesStatusLabel = mbtilesReady ? 'MBTiles ready' : 'MBTiles missing';
+  const mbtilesSizeLabel = mbtilesReady && mbtilesBytes != null ? formatBytes(mbtilesBytes) : '—';
 
   const commitAudioSettings = async (payload: { volume?: number }) => {
     if (audioPendingRef.current) {
@@ -333,6 +369,21 @@ export function SettingsScreen({
     alertsPendingRef.current = false;
   };
 
+  const commitMapsSettings = async (payload: { mode?: 'online' | 'offline' | 'auto'; offline_pack_id?: string | null }) => {
+    if (mapsPendingRef.current) return;
+    mapsPendingRef.current = true;
+    setMapsSaveState('saving');
+    const res = await updateMapsSettings(payload);
+    setMapsSaveState(res.ok ? 'saved' : (res.error === 'not supported in this build' ? 'unsupported' : 'error'));
+    mapsPendingRef.current = false;
+  };
+
+  const emitMapsChange = (mode: 'online' | 'offline' | 'auto', packId: string) => {
+    try {
+      window.dispatchEvent(new CustomEvent('maps-settings-changed', { detail: { mode, offline_pack_id: packId } }));
+    } catch {}
+  };
+
   useEffect(() => {
     if (!initRef.current) return;
     const t = window.setTimeout(() => {
@@ -358,13 +409,73 @@ export function SettingsScreen({
     return <RfScanSettings onBack={() => setShowRfSettings(false)} />;
   }
 
+  const groupMenu = [
+    { id: 'system', label: 'System', description: 'Device health, storage, power', icon: Activity },
+    { id: 'audio', label: 'Audio', description: 'Volume, speaker, buzzer', icon: Volume2 },
+    { id: 'sensors', label: 'Sensors', description: 'ESP32, RF, Remote ID', icon: Radio },
+    { id: 'maps', label: 'Maps', description: 'Offline packs and status', icon: Map },
+    { id: 'alerts', label: 'Alerts', description: 'Alert presets', icon: Bell },
+    { id: 'video', label: 'Video', description: 'Capture settings', icon: Video },
+    { id: 'network', label: 'Network', description: 'Wi-Fi and Bluetooth', icon: Wifi },
+    { id: 'diagnostics', label: 'Diagnostics', description: 'Logs and advanced tools', icon: Code },
+  ];
+
+  if (!activeGroup) {
+    return (
+      <div
+        ref={scrollRef}
+        className="flex-1 min-h-0 overflow-y-auto scroll-panel px-4 pb-[calc(var(--tab-bar-height)+16px)] pt-[calc(76px+env(safe-area-inset-top))] space-y-4"
+        style={{ touchAction: 'pan-y' }}
+      >
+        <section>
+          <h2 className="text-[19px] font-semibold text-slate-100 mb-3">Settings</h2>
+          <Card>
+            <div className="divide-y divide-slate-800">
+              {groupMenu.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={item.id}
+                    onClick={() => setActiveGroup(item.id)}
+                    className="w-full flex items-center justify-between p-4 rounded-2xl hover:bg-slate-800 active:bg-slate-700 transition-colors min-h-[72px]"
+                  >
+                    <div className="flex items-center gap-3">
+                      <Icon size={18} className="text-slate-300" />
+                      <div className="text-left">
+                        <div className="text-[15px] font-semibold text-slate-100">{item.label}</div>
+                        <div className="text-[12px] text-slate-400">{item.description}</div>
+                      </div>
+                    </div>
+                    <ChevronRight size={18} className="text-slate-500" />
+                  </button>
+                );
+              })}
+            </div>
+          </Card>
+        </section>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={scrollRef}
-      className="flex-1 min-h-0 overflow-y-auto scroll-panel px-4 pb-4 pt-[calc(76px+env(safe-area-inset-top))] space-y-4"
+      className="flex-1 min-h-0 overflow-y-auto scroll-panel px-4 pb-[calc(var(--tab-bar-height)+16px)] pt-[calc(76px+env(safe-area-inset-top))] space-y-4"
       style={{ touchAction: 'pan-y' }}
     >
+      <div className="flex items-center gap-3">
+        <button
+          onClick={() => setActiveGroup(null)}
+          className="p-2 rounded-full hover:bg-slate-800 active:bg-slate-700 transition-colors"
+        >
+          <ChevronLeft size={18} className="text-slate-300" />
+        </button>
+        <div className="text-[18px] font-semibold text-slate-100">
+          {groupMenu.find((g) => g.id === activeGroup)?.label || 'Settings'}
+        </div>
+      </div>
       {/* Audio Section */}
+      {activeGroup === 'audio' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Volume2 size={20} />
@@ -401,8 +512,10 @@ export function SettingsScreen({
           </div>
         </Card>
       </section>
+      )}
 
       {/* System Section */}
+      {activeGroup === 'system' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Activity size={20} />
@@ -420,8 +533,10 @@ export function SettingsScreen({
           </div>
         </Card>
       </section>
+      )}
 
       {/* Device Hardware Section */}
+      {activeGroup === 'system' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Activity size={20} />
@@ -444,8 +559,10 @@ export function SettingsScreen({
           </div>
         </Card>
       </section>
+      )}
 
       {/* Power & Reboot Section */}
+      {activeGroup === 'system' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Power size={20} />
@@ -475,8 +592,10 @@ export function SettingsScreen({
           </div>
         </Card>
       </section>
+      )}
 
       {/* Sensors Section */}
+      {activeGroup === 'sensors' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Wifi size={20} />
@@ -543,23 +662,71 @@ export function SettingsScreen({
           </Card>
         </div>
       </section>
+      )}
 
       {/* Maps Section */}
+      {activeGroup === 'maps' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Map size={20} />
           <span className="flex-1">Maps</span>
+          <SaveStatus state={mapsSaveState} />
         </h2>
         <Card>
           <div className="space-y-4">
-            <InfoRow label="Provider" value="Offline (MapLibre)" />
-            <InfoRow label="Status" value={pmtilesStatusLabel} />
-            <InfoRow label="File size" value={pmtilesSizeLabel} />
+            <div className="flex flex-col gap-2">
+              <div className="text-[15px] text-slate-300 font-medium">Map Mode</div>
+              <div className="flex flex-wrap gap-2">
+                <Chip
+                  label="Online"
+                  active={mapMode === 'online'}
+                  size="md"
+                  onClick={() => {
+                    setMapMode('online');
+                    const packId = offlinePackId || 'asia';
+                    emitMapsChange('online', packId);
+                    commitMapsSettings({ mode: 'online', offline_pack_id: packId });
+                  }}
+                />
+                <Chip
+                  label="Auto"
+                  active={mapMode === 'auto'}
+                  size="md"
+                  onClick={() => {
+                    setMapMode('auto');
+                    const packId = offlinePackId || 'asia';
+                    emitMapsChange('auto', packId);
+                    commitMapsSettings({ mode: 'auto', offline_pack_id: packId });
+                  }}
+                />
+                <Chip
+                  label="Offline"
+                  active={mapMode === 'offline'}
+                  size="md"
+                  onClick={() => {
+                    setMapMode('offline');
+                    const packId = offlinePackId || 'asia';
+                    emitMapsChange('offline', packId);
+                    commitMapsSettings({ mode: 'offline', offline_pack_id: packId });
+                  }}
+                />
+              </div>
+              <div className="text-[12px] text-slate-500">
+                Auto switches to offline when there is no internet.
+              </div>
+            </div>
+
+            <InfoRow label="Offline Pack" value={`${offlinePackId || 'asia'}.mbtiles`} />
+            <InfoRow label="Pack Status" value={mbtilesStatusLabel} />
+            <InfoRow label="Pack Size" value={mbtilesSizeLabel} />
+            <InfoRow label="PMTiles (legacy)" value={`${pmtilesStatusLabel} • ${pmtilesSizeLabel}`} />
           </div>
         </Card>
       </section>
+      )}
 
       {/* Alert Presets Section */}
+      {activeGroup === 'alerts' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Bell size={20} />
@@ -601,8 +768,10 @@ export function SettingsScreen({
           </div>
         </Card>
       </section>
+      )}
 
       {/* Video Capture Section */}
+      {activeGroup === 'video' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Video size={20} />
@@ -631,8 +800,17 @@ export function SettingsScreen({
           </div>
         </Card>
       </section>
+      )}
+
+      {/* Network Section */}
+      {activeGroup === 'network' && (
+      <section>
+        <NetworkSettings />
+      </section>
+      )}
 
       {/* Debug Section */}
+      {activeGroup === 'diagnostics' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Code size={20} />
@@ -672,8 +850,10 @@ export function SettingsScreen({
           </div>
         </Card>
       </section>
+      )}
 
       {/* RF Scanning (Advanced) Section */}
+      {activeGroup === 'diagnostics' && (
       <section>
         <h2 className="text-[19px] font-semibold text-slate-100 mb-3 flex items-center gap-2">
           <Radio size={20} />
@@ -696,6 +876,7 @@ export function SettingsScreen({
           </button>
         </Card>
       </section>
+      )}
     </div>
   );
 }

@@ -164,17 +164,15 @@ export function ContactsDrawerContent({
             )}
           </div>
 
-          {/* Sort toggle */}
-          <SortToggle
-            mode={sortMode}
-            onModeChange={setSortMode}
-          />
-          
-          {/* Hide toggles */}
-          <div className="flex items-center gap-2">
+          {/* Sort + hide toggles in one line */}
+          <div className="flex items-center gap-2 overflow-x-auto">
+            <SortToggle
+              mode={sortMode}
+              onModeChange={setSortMode}
+            />
             <button
               onClick={() => setHideLost(!hideLost)}
-              className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium transition-colors border ${
+              className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium transition-colors border whitespace-nowrap ${
                 hideLost 
                   ? 'bg-slate-700 text-slate-200 border-slate-600' 
                   : 'bg-slate-800 text-slate-400 border-slate-700'
@@ -185,7 +183,7 @@ export function ContactsDrawerContent({
             </button>
             <button
               onClick={() => setHideStale(!hideStale)}
-              className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium transition-colors border ${
+              className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium transition-colors border whitespace-nowrap ${
                 hideStale 
                   ? 'bg-slate-700 text-slate-200 border-slate-600' 
                   : 'bg-slate-800 text-slate-400 border-slate-700'

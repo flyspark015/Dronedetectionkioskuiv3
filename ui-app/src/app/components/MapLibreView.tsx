@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 
 const PMTILES_BASE_URL = '/pmtiles';
 const FIXED_PACK_ID = 'india';
+const MBTILES_PACK_ID = 'asia';
+const MBTILES_STATUS_URL = '/api/v1/maps/mbtiles/status';
+const MBTILES_TILE_URL = `/mbtiles/${MBTILES_PACK_ID}/{z}/{x}/{y}.png`;
 const buildHttpUrl = (packId: string) => {
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
   return `${origin}${PMTILES_BASE_URL}/${packId}.pmtiles`;
@@ -134,10 +137,12 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
   const [libsReady, setLibsReady] = useState(false);
   const [mapError, setMapError] = useState<Error | null>(null);
   const [mapUnsupported, setMapUnsupported] = useState(false);
-  const [pmtilesKind, setPmtilesKind] = useState<'vector' | 'raster' | null>(null);
+  const [pmtilesKind, setPmtilesKind] = useState<'vector' | 'raster' | 'mbtiles' | null>(null);
   const [packError, setPackError] = useState<string | null>(null);
   const [packHeader, setPackHeader] = useState<any | null>(null);
   const [packLayers, setPackLayers] = useState<string[] | null>(null);
+  const [mbtilesReady, setMbtilesReady] = useState(false);
+  const [mbtilesMeta, setMbtilesMeta] = useState<any | null>(null);
   const [workerReady, setWorkerReady] = useState(false);
   const [initTimeout, setInitTimeout] = useState(false);
   const [initReason, setInitReason] = useState<string | null>(null);
@@ -257,6 +262,27 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
       window.clearTimeout(debugPublishTimer.current);
       debugPublishTimer.current = null;
     }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadMbtiles = async () => {
+      try {
+        const res = await fetch(MBTILES_STATUS_URL, { cache: 'no-store' });
+        const data = await res.json().catch(() => null);
+        if (cancelled) return;
+        if (res.ok && data?.ok) {
+          setMbtilesReady(Boolean(data.exists));
+          setMbtilesMeta(data);
+        }
+      } catch {
+        // ignore mbtiles errors
+      }
+    };
+    loadMbtiles();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -381,7 +407,13 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
         if (cancelled) return;
         setPmtilesKind(null);
         setPackHeader(null);
-        setPackError('pack_unavailable');
+        if (mbtilesReady) {
+          setPackError(null);
+          setPmtilesKind('mbtiles');
+          setPackLayers([]);
+        } else {
+          setPackError('pack_unavailable');
+        }
       });
     pmtiles
       .getMetadata()
@@ -400,7 +432,15 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
     return () => {
       cancelled = true;
     };
-  }, [libsReady, mapUnsupported]);
+  }, [libsReady, mapUnsupported, mbtilesReady]);
+
+  useEffect(() => {
+    if (!mbtilesReady) return;
+    if (!packError || pmtilesKind) return;
+    setPackError(null);
+    setPmtilesKind('mbtiles');
+    setPackLayers([]);
+  }, [mbtilesReady, packError, pmtilesKind]);
 
   useEffect(() => {
     if (pmtilesKind !== 'vector') return;
@@ -451,7 +491,20 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
 
     let packCenter: [number, number] | null = null;
     let packBounds: [[number, number], [number, number]] | null = null;
-    if (packHeader) {
+    if (pmtilesKind === 'mbtiles' && mbtilesMeta) {
+      const bounds = Array.isArray(mbtilesMeta.bounds) ? mbtilesMeta.bounds : null;
+      if (bounds && bounds.length === 4) {
+        packBounds = [[bounds[0], bounds[1]], [bounds[2], bounds[3]]];
+      }
+      const center = Array.isArray(mbtilesMeta.center) ? mbtilesMeta.center : null;
+      if (center && center.length >= 2) {
+        packCenter = [center[0], center[1]];
+      } else if (packBounds) {
+        const westCenter = (packBounds[0][0] + packBounds[1][0]) / 2;
+        const southCenter = (packBounds[0][1] + packBounds[1][1]) / 2;
+        packCenter = [westCenter, southCenter];
+      }
+    } else if (packHeader) {
       const west = Number(packHeader.minLon ?? packHeader.min_lon);
       const east = Number(packHeader.maxLon ?? packHeader.max_lon);
       const south = Number(packHeader.minLat ?? packHeader.min_lat);
@@ -473,15 +526,18 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
     const center = packCenter ?? [78.9629, 20.5937];
     const packZoom = packHeader && Number.isFinite(Number(packHeader.centerZoom)) ? Number(packHeader.centerZoom) : null;
     const headerMaxZoom = Number(packHeader?.maxZoom ?? packHeader?.max_zoom);
-    const maxZoom = Number.isFinite(headerMaxZoom) ? Math.min(headerMaxZoom, 16) : 16;
+    const mbMaxZoom = mbtilesMeta && Number.isFinite(Number(mbtilesMeta.maxzoom)) ? Number(mbtilesMeta.maxzoom) : null;
+    const maxZoom = Number.isFinite(headerMaxZoom) ? Math.min(headerMaxZoom, 16) : Number.isFinite(mbMaxZoom) ? Math.min(mbMaxZoom, 18) : 16;
     const zoom = packZoom ?? 6;
 
     const pmtilesUrl = buildPmtilesUrl(packId);
     const style = INITIAL_STYLE;
-    const sourceSpec = pmtilesKind === 'raster'
-      ? { type: 'raster', url: pmtilesUrl, tileSize: 256 }
-      : { type: 'vector', url: pmtilesUrl };
-    const layerDefs = pmtilesKind === 'raster'
+    const sourceSpec = pmtilesKind === 'mbtiles'
+      ? { type: 'raster', tiles: [MBTILES_TILE_URL], tileSize: 256 }
+      : pmtilesKind === 'raster'
+        ? { type: 'raster', url: pmtilesUrl, tileSize: 256 }
+        : { type: 'vector', url: pmtilesUrl };
+    const layerDefs = pmtilesKind === 'mbtiles' || pmtilesKind === 'raster'
       ? [buildRasterLayer()]
       : buildVectorLayers(packLayers);
     const finalStyle = buildStyle(sourceSpec, layerDefs);

@@ -4,6 +4,8 @@ import { GoogleMap, useLoadScript } from '@react-google-maps/api';
 import type { Contact } from '@/app/types/contacts';
 import { isRemoteIdContact } from '@/app/types/contacts';
 import { getMapPackStatus } from '@/app/services/settings';
+import { OfflineMapLibre } from '@/app/components/OfflineMapLibre';
+import { CoordinateBar } from '@/app/components/CoordinateBar';
 import droneSvg from '@/app/assets/remoteid/drone.svg?raw';
 import pilotSvg from '@/app/assets/remoteid/pilot.svg?raw';
 import homeSvg from '@/app/assets/remoteid/home.svg?raw';
@@ -55,19 +57,6 @@ const iconSvg = {
   home: homeSvg,
 };
 
-const TILE_SIZE = 256;
-
-const clampLat = (lat: number) => Math.max(-85.05112878, Math.min(85.05112878, lat));
-
-const lonLatToTile = (lon: number, lat: number, zoom: number) => {
-  const clampedLat = clampLat(lat);
-  const n = 2 ** zoom;
-  const xtile = Math.floor(((lon + 180) / 360) * n);
-  const latRad = (clampedLat * Math.PI) / 180;
-  const ytile = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
-  return { x: Math.max(0, Math.min(n - 1, xtile)), y: Math.max(0, Math.min(n - 1, ytile)) };
-};
-
 const getBboxCenter = (bbox?: { north: number; south: number; east: number; west: number }) => {
   if (!bbox) return null;
   const lat = (Number(bbox.north) + Number(bbox.south)) / 2;
@@ -76,8 +65,7 @@ const getBboxCenter = (bbox?: { north: number; south: number; east: number; west
   return { lat, lng: lon };
 };
 
-const buildTileUrl = (packId: string, z: number, x: number, y: number) =>
-  `/tiles/${packId}/${z}/${x}/${y}.png`;
+const buildTileTemplate = (packId: string) => `/tiles/${packId}/{z}/{x}/{y}.png`;
 
 const createMarkerElement = (type: 'drone' | 'pilot' | 'home', offset?: { x: number; y: number }) => {
   const wrapper = document.createElement('div');
@@ -140,7 +128,6 @@ export function GoogleMapView({
   onLoadError,
 }: Props) {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined;
-  const mapId = import.meta.env.VITE_GOOGLE_MAPS_MAP_ID as string | undefined;
 
   const { isLoaded, loadError } = useLoadScript({
     googleMapsApiKey: apiKey || '',
@@ -192,6 +179,12 @@ export function GoogleMapView({
   const [isOnline, setIsOnline] = useState(() => (typeof navigator !== 'undefined' ? navigator.onLine : true));
   const [offlinePack, setOfflinePack] = useState<OfflinePack | null>(null);
   const [offlinePackError, setOfflinePackError] = useState<string | null>(null);
+  const [clickedCoord, setClickedCoord] = useState<Coord | null>(null);
+  const buildTagLabel = useMemo(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.has('build_tag') ? 'offline-hard-20260207' : null;
+  }, []);
 
   const mapRef = useRef<google.maps.Map | null>(null);
   const myMarkerRef = useRef<any>(null);
@@ -202,6 +195,8 @@ export function GoogleMapView({
   const lastFocusRef = useRef<{ id: string; lat: number; lon: number } | null>(null);
   const autoCenteredRef = useRef(false);
   const userInteractedRef = useRef(false);
+  const onlineMapTypeRef = useRef<google.maps.MapTypeId>('satellite');
+  const mapTypeListenerRef = useRef<google.maps.MapsEventListener | null>(null);
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -221,6 +216,9 @@ export function GoogleMapView({
       setOfflinePackError(null);
       return undefined;
     }
+    // Clear stale pack while loading the next selection.
+    setOfflinePack(null);
+    setOfflinePackError(null);
     getMapPackStatus(offlinePackId).then((res) => {
       if (!active) return;
       if (res.ok && res.data?.pack) {
@@ -251,9 +249,20 @@ export function GoogleMapView({
     return Math.min(Math.max(zmax, zmin), 20);
   }, [offlinePack]);
 
-  const offlineMode = mapMode === 'offline' || !isOnline;
+  const offlineSelected = mapMode === 'offline';
+  const offlineAuto = mapMode === 'auto' && !isOnline;
+  const offlineMode = offlineSelected || offlineAuto;
   const scriptUnavailable = !apiKey || Boolean(loadError);
-  const useOfflineTiles = (offlineMode || scriptUnavailable) && Boolean(offlinePackId);
+
+  const offlinePackSelected = Boolean(offlinePackId && offlinePackId.trim());
+  const offlinePackMatches = Boolean(offlinePack && offlinePack.id === offlinePackId);
+  const offlineStatusRaw = String(offlinePack?.status ?? '').toLowerCase();
+  const offlineStatusOk = offlineStatusRaw === 'ready' || offlineStatusRaw === 'done';
+  const offlineBboxOk = Boolean(offlinePack?.bbox) && Boolean(offlineCenter);
+  const offlinePackOk = offlinePackSelected && offlinePackMatches && offlineStatusOk && offlineBboxOk;
+
+  const useOfflineFallback = !offlineMode && scriptUnavailable && offlinePackOk;
+  const useOfflineTiles = (offlineMode && offlinePackOk) || useOfflineFallback;
 
   const handleBoundaryError = (err: Error) => {
     setRenderError(err);
@@ -434,38 +443,6 @@ export function GoogleMapView({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !isLoaded) return;
-
-    const offlineTypeId = 'offline-pack';
-    if (!useOfflineTiles || !offlinePackId) {
-      if (map.getMapTypeId() === offlineTypeId) {
-        map.setMapTypeId('hybrid');
-      }
-      return;
-    }
-
-    const minZoom = Number(offlinePack?.zmin ?? 0);
-    const maxZoom = Number(offlinePack?.zmax ?? 22);
-
-    if (!map.mapTypes.get(offlineTypeId)) {
-      const offlineType = new google.maps.ImageMapType({
-        name: 'Offline',
-        tileSize: new google.maps.Size(TILE_SIZE, TILE_SIZE),
-        minZoom: Number.isFinite(minZoom) ? minZoom : 0,
-        maxZoom: Number.isFinite(maxZoom) ? maxZoom : 22,
-        getTileUrl: (coord, zoom) => buildTileUrl(offlinePackId, zoom, coord.x, coord.y),
-      });
-      map.mapTypes.set(offlineTypeId, offlineType);
-    }
-
-    if (Number.isFinite(minZoom) && Number.isFinite(maxZoom)) {
-      map.setOptions({ minZoom, maxZoom });
-    }
-    map.setMapTypeId(offlineTypeId);
-  }, [useOfflineTiles, offlinePackId, offlinePack?.zmin, offlinePack?.zmax, isLoaded]);
-
-  useEffect(() => {
-    const map = mapRef.current;
     if (!map || !isLoaded || !focusContact || !isRemoteIdContact(focusContact)) return;
 
     const cached = markerCacheRef.current.get(focusContact.id);
@@ -504,65 +481,70 @@ export function GoogleMapView({
         window.clearTimeout(updateTimerRef.current);
         updateTimerRef.current = null;
       }
+      if (mapTypeListenerRef.current) {
+        mapTypeListenerRef.current.remove();
+        mapTypeListenerRef.current = null;
+      }
     };
   }, []);
 
-  const showOfflineFallback = (offlineMode || scriptUnavailable) && (!isLoaded || loadError || !apiKey || renderError);
-
-  if (showOfflineFallback) {
-    if (!offlineMode && !offlinePackId && !apiKey) {
-      return (
-        <div className="h-full w-full rounded-2xl border border-slate-800 bg-slate-950/40 flex items-center justify-center text-slate-300 text-sm">
-          Google Maps API key missing (set VITE_GOOGLE_MAPS_API_KEY)
-        </div>
-      );
-    }
-    if (!offlinePackId) {
-      return (
-        <div className="h-full w-full rounded-2xl border border-slate-800 bg-slate-950/40 flex items-center justify-center text-slate-300 text-sm">
-          Offline map pack not selected
-        </div>
-      );
-    }
-
-    if (!offlinePack || !offlineCenter) {
-      return (
-        <div className="h-full w-full rounded-2xl border border-slate-800 bg-slate-950/40 flex flex-col items-center justify-center text-slate-300 text-sm gap-2">
-          <div>Offline pack unavailable</div>
-          {offlinePackError && (
-            <div className="text-xs text-slate-500">{offlinePackError}</div>
-          )}
-        </div>
-      );
-    }
-
-    const zoom = offlineZoom;
-    const centerTile = lonLatToTile(offlineCenter.lng, offlineCenter.lat, zoom);
-    const tiles: Array<{ key: string; x: number; y: number }> = [];
-    for (let dy = -1; dy <= 1; dy += 1) {
-      for (let dx = -1; dx <= 1; dx += 1) {
-        const x = centerTile.x + dx;
-        const y = centerTile.y + dy;
-        tiles.push({ key: `${zoom}/${x}/${y}`, x, y });
+  if (offlineSelected && !offlinePackOk) {
+    const reasons: string[] = [];
+    if (!offlinePackSelected) {
+      reasons.push('No offline pack selected');
+    } else {
+      if (!offlinePack) reasons.push('Offline pack not found');
+      if (offlinePack && offlinePack.id !== offlinePackId) {
+        reasons.push(`Loaded pack: ${offlinePack.id}`);
       }
+      if (offlinePack && !offlineStatusOk) reasons.push(`Pack status: ${offlinePack?.status ?? 'unknown'}`);
+      if (offlinePack && !offlineBboxOk) reasons.push('Pack bbox missing');
+      if (offlinePackError) reasons.push(`Pack error: ${offlinePackError}`);
     }
 
     return (
-      <div className="relative h-full w-full overflow-hidden rounded-2xl border border-slate-800 bg-slate-950">
+      <div className="h-full w-full rounded-2xl border border-slate-800 bg-slate-950/40 flex flex-col items-center justify-center text-slate-300 text-sm gap-2 px-4 text-center">
+        <div className="text-slate-100 font-medium">Offline pack not ready</div>
+        {reasons.length > 0 && (
+          <div className="text-xs text-slate-500">{reasons.join(' • ')}</div>
+        )}
+        {buildTagLabel && (
+          <div className="text-[10px] text-slate-600">build: {buildTagLabel}</div>
+        )}
+      </div>
+    );
+  }
+
+  const defaultZoom = useOfflineTiles ? offlineZoom : 16;
+  const offlineMinZoom = Number.isFinite(Number(offlinePack?.zmin)) ? Number(offlinePack?.zmin) : 0;
+  const offlineMaxZoom = Number.isFinite(Number(offlinePack?.zmax)) ? Number(offlinePack?.zmax) : 22;
+  const offlineInitialZoom = Math.min(defaultZoom, offlineMaxZoom);
+
+  if (useOfflineTiles && offlineCenter) {
+    return (
+      <div className="relative h-full w-full overflow-hidden rounded-2xl border border-slate-800">
         <div className="absolute top-2 left-2 z-10 rounded-full bg-slate-900/90 px-3 py-1 text-[11px] text-slate-100">
           Offline map (cached tiles)
         </div>
-        <div className="grid h-full w-full grid-cols-3 grid-rows-3">
-          {tiles.map((tile) => (
-            <img
-              key={tile.key}
-              src={buildTileUrl(offlinePackId, zoom, tile.x, tile.y)}
-              alt="offline tile"
-              className="h-full w-full object-cover"
-              loading="lazy"
-            />
-          ))}
-        </div>
+        {buildTagLabel && (
+          <div className="absolute top-2 right-2 z-10 rounded-full bg-slate-900/90 px-2 py-1 text-[10px] text-slate-300">
+            build: {buildTagLabel}
+          </div>
+        )}
+        <OfflineMapLibre
+          key={`offline-${offlinePackId}-${offlineMinZoom}-${offlineMaxZoom}`}
+          center={{ lat: offlineCenter.lat, lng: offlineCenter.lng }}
+          zoom={offlineInitialZoom}
+          minZoom={offlineMinZoom}
+          maxZoom={offlineMaxZoom}
+          tileUrl={buildTileTemplate(offlinePackId as string)}
+          onMapClick={(coord) => setClickedCoord(coord)}
+        />
+        <CoordinateBar
+          lat={clickedCoord?.lat ?? null}
+          lon={clickedCoord?.lon ?? null}
+          onClear={() => setClickedCoord(null)}
+        />
       </div>
     );
   }
@@ -593,14 +575,14 @@ export function GoogleMapView({
 
   return (
     <div className="relative h-full w-full overflow-hidden rounded-2xl border border-slate-800">
-      {useOfflineTiles && (
-        <div className="absolute top-2 left-2 z-10 rounded-full bg-slate-900/90 px-3 py-1 text-[11px] text-slate-100">
-          Offline map (cached tiles)
-        </div>
-      )}
       {offlineMode && !offlinePackId && (
         <div className="absolute top-2 left-2 z-10 rounded-full bg-slate-900/90 px-3 py-1 text-[11px] text-slate-100">
           No offline pack selected
+        </div>
+      )}
+      {buildTagLabel && (
+        <div className="absolute top-2 right-2 z-10 rounded-full bg-slate-900/90 px-2 py-1 text-[10px] text-slate-300">
+          build: {buildTagLabel}
         </div>
       )}
       <MapErrorBoundary onError={handleBoundaryError}>
@@ -608,6 +590,21 @@ export function GoogleMapView({
           mapContainerStyle={containerStyle}
           onLoad={(m) => {
             mapRef.current = m;
+            try {
+              m.setMapTypeId(onlineMapTypeRef.current);
+            } catch {}
+            if (mapTypeListenerRef.current) {
+              mapTypeListenerRef.current.remove();
+            }
+            mapTypeListenerRef.current = m.addListener('maptypeid_changed', () => {
+              const next = m.getMapTypeId();
+              if (next) onlineMapTypeRef.current = next;
+            });
+          }}
+          onClick={(evt) => {
+            const ll = evt?.latLng;
+            if (!ll) return;
+            setClickedCoord({ lat: ll.lat(), lon: ll.lng() });
           }}
           onDragStart={() => {
             userInteractedRef.current = true;
@@ -616,10 +613,9 @@ export function GoogleMapView({
             userInteractedRef.current = true;
           }}
           defaultCenter={initialCenter}
-          defaultZoom={16}
+          defaultZoom={defaultZoom}
           options={{
-            mapTypeId: 'roadmap',
-            ...(mapId ? { mapId } : {}),
+            mapTypeId: onlineMapTypeRef.current,
             fullscreenControl: false,
             streetViewControl: false,
             mapTypeControl: true,
@@ -627,6 +623,11 @@ export function GoogleMapView({
           }}
         />
       </MapErrorBoundary>
+      <CoordinateBar
+        lat={clickedCoord?.lat ?? null}
+        lon={clickedCoord?.lon ?? null}
+        onClear={() => setClickedCoord(null)}
+      />
     </div>
   );
 }
