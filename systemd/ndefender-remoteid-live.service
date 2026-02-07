@@ -1,0 +1,25 @@
+[Unit]
+Description=N-Defender Remote ID Live Capture
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ndefender/remoteid
+ExecStartPre=/bin/sh -c 'iw dev | grep -q "Interface mon0" || iw dev wlan1 interface add mon0 type monitor'
+ExecStartPre=/sbin/ip link set wlan1 down
+ExecStartPre=/sbin/ip link set mon0 up
+ExecStart=/opt/ndefender/remoteid/venv/bin/python -u /opt/ndefender/remoteid/rid_live_capture.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+Environment=NDEFENDER_RID_PARENT_IFACE=mon0
+Environment=NDEFENDER_RID_MON_IFACE=mon0
+Environment=NDEFENDER_RID_CHANNELS=1,6,11,36,44,149
+Environment=NDEFENDER_RID_DWELL_S=0.7
+Environment=NDEFENDER_RID_RAW_JSONL=/opt/ndefender/logs/remoteid_live.jsonl
+Environment=NDEFENDER_RID_DEC_JSONL=/opt/ndefender/logs/remoteid_decoded.jsonl
+
+[Install]
+WantedBy=multi-user.target

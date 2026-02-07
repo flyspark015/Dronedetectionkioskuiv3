@@ -15,5 +15,10 @@ ui-app/dist/
 # OS cruft
 .DS_Store
 
+# local assets + caches
+/assets/
+**/__pycache__/
+*.pyc
+
 # nested repo backup
 ui-app/.git.bak/

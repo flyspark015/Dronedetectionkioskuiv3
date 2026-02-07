@@ -5,7 +5,7 @@ import serial
 from typing import Any, Dict, Optional, Set, List, Tuple
 from collections import deque
 
-from flask import send_from_directory, Flask, jsonify, request
+from flask import send_from_directory, send_file, Flask, jsonify, request
 from flask_sock import Sock
 
 APP_PORT = 8000
@@ -16,6 +16,26 @@ UI_SETTINGS_FILE = os.path.join(STATE_DIR, "ui_settings.json")
 AUDIO_SETTINGS_FILE = os.path.join(STATE_DIR, "audio_settings.json")
 MAPS_SETTINGS_FILE = os.path.join(STATE_DIR, "maps_settings.json")
 ALERTS_SETTINGS_FILE = os.path.join(STATE_DIR, "alerts_settings.json")
+try:
+    AUDIO_ALSA_CARD = int(os.environ.get("NDEFENDER_AUDIO_CARD", "2") or 2)
+except Exception:
+    AUDIO_ALSA_CARD = 2
+AUDIO_ALSA_DEVICE = os.environ.get("NDEFENDER_AUDIO_DEVICE") or f"hw:{AUDIO_ALSA_CARD},0"
+AUDIO_ALSA_CONTROL = os.environ.get("NDEFENDER_AUDIO_CONTROL") or "Speaker"
+AUDIO_MAP_FILE = "/opt/ndefender/system/audio_map.json"
+AUDIO_WAV_DIR = "/opt/ndefender/assets/audio_wav"
+DEFAULT_AUDIO_MAP = {
+    "ui_click": "/opt/ndefender/assets/audio/ui_click.mp3",
+    "startup_bg": "/opt/ndefender/assets/audio/startup_bg.mp3",
+    "drone_detected_alarm": "/opt/ndefender/assets/audio/drone_detected_alarm.mp3",
+    "test_buzzer": "/opt/ndefender/assets/audio/test_buzzer.mp3",
+}
+_AUDIO_MAP_CACHE: Optional[Dict[str, str]] = None
+_AUDIO_ASSETS_STATUS = {
+    "ok_keys": [],
+    "missing_keys": [],
+    "empty_keys": [],
+}
 MAPS_PACKS_STATE_FILE = os.path.join(STATE_DIR, "map_packs.json")
 MAPS_PACKS_DIR = os.environ.get("NDEFENDER_MAPS_PACKS_DIR", "/opt/ndefender/maps/packs")
 MAPS_TILE_URL_TEMPLATE = os.environ.get("NDEFENDER_GOOGLE_TILE_URL_TEMPLATE") or ""
@@ -253,10 +273,12 @@ def _pulse_env() -> Optional[Dict[str, str]]:
     return None
 
 def _detect_audio_backend() -> str:
-    if shutil.which("pactl") and _pulse_env():
-        return "pactl"
     if shutil.which("amixer"):
         return "amixer"
+    if shutil.which("wpctl"):
+        code, _ = _run_cmd(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+        if code == 0:
+            return "wpctl"
     return ""
 
 def _parse_percent(text: str) -> Optional[int]:
@@ -273,56 +295,278 @@ def _parse_percent(text: str) -> Optional[int]:
         return None
 
 def _get_volume_percent() -> Tuple[Optional[int], Optional[str]]:
-    backend = _detect_audio_backend()
-    if backend == "amixer":
-        code, out = _run_cmd(["amixer", "get", "Master"])
+    if shutil.which("amixer"):
+        code, out = _run_cmd(["amixer", "-c", str(AUDIO_ALSA_CARD), "get", "Playback"])
         if code == 0:
             val = _parse_percent(out)
             if val is not None:
                 return val, None
-        # fallback: try first playback control name
-        code, out = _run_cmd(["amixer", "scontrols"])
-        if code == 0:
-            m = re.search(r"'([^']+)'", out)
-            if m:
-                ctrl = m.group(1)
-                code2, out2 = _run_cmd(["amixer", "get", ctrl])
-                if code2 == 0:
-                    val = _parse_percent(out2)
-                    if val is not None:
-                        return val, None
         return None, "amixer_failed"
 
-    if backend == "pactl":
-        pulse_env = _pulse_env()
-        if not pulse_env:
-            return None, "pulse_unavailable"
-        code, out = _run_cmd(["pactl", "get-sink-volume", "@DEFAULT_SINK@"], extra_env=pulse_env)
+    backend = _detect_audio_backend()
+    if backend == "wpctl":
+        code, out = _run_cmd(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
         if code == 0:
-            val = _parse_percent(out)
-            if val is not None:
-                return val, None
-        return None, "pactl_failed"
+            m = re.search(r"([0-9]*\\.?[0-9]+)", out)
+            if m:
+                try:
+                    val = int(round(float(m.group(1)) * 100))
+                    return max(0, min(100, val)), None
+                except Exception:
+                    pass
+        return None, "wpctl_failed"
 
     return None, "no_audio_backend"
 
-def _set_volume_percent(percent: int) -> Tuple[bool, Optional[str]]:
+def _set_volume_percent(percent: int) -> Tuple[bool, Optional[str], Dict[str, Any], int]:
     percent = max(0, min(100, int(percent)))
-    backend = _detect_audio_backend()
-    if backend == "amixer":
-        code, out = _run_cmd(["amixer", "set", "Master", f"{percent}%"])
-        if code == 0:
-            return True, None
-        return False, out or "amixer_failed"
-    if backend == "pactl":
-        pulse_env = _pulse_env()
-        if not pulse_env:
-            return False, "pulse_unavailable"
-        code, out = _run_cmd(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{percent}%"], extra_env=pulse_env)
-        if code == 0:
-            return True, None
-        return False, out or "pactl_failed"
-    return False, "no_audio_backend"
+    applied = 0 if percent == 0 else max(10, percent)
+    info = {
+        "backend": "amixer" if shutil.which("amixer") else (_detect_audio_backend() or None),
+        "speaker_control": "Speaker",
+        "playback_control": "Playback",
+        "alsa_card": AUDIO_ALSA_CARD,
+        "requested_percent": percent,
+        "applied_percent": applied,
+    }
+    if shutil.which("amixer") is None:
+        return False, "amixer_not_found", info, applied
+
+    code1, out1 = _run_cmd(["amixer", "-c", str(AUDIO_ALSA_CARD), "set", "Speaker", "100%", "unmute"])
+    if applied <= 0:
+        code2, out2 = _run_cmd(["amixer", "-c", str(AUDIO_ALSA_CARD), "set", "Playback", "0%", "mute"])
+    else:
+        code2, out2 = _run_cmd(["amixer", "-c", str(AUDIO_ALSA_CARD), "set", "Playback", f"{applied}%", "unmute"])
+
+    ok = code1 == 0 and code2 == 0
+    if ok:
+        return True, None, info, applied
+    err = (out2 or out1 or "amixer_failed").strip()
+    return False, err, info, applied
+
+_AUDIO_PROC_LOCK = threading.Lock()
+_AUDIO_PROC: Optional[subprocess.Popen] = None
+_MIXER_INIT_LOCK = threading.Lock()
+_MIXER_INIT_DONE = False
+
+def _load_audio_map(force: bool = False) -> Dict[str, str]:
+    global _AUDIO_MAP_CACHE
+    if _AUDIO_MAP_CACHE is not None and not force:
+        return dict(_AUDIO_MAP_CACHE)
+    data: Dict[str, str] = {}
+    try:
+        with open(AUDIO_MAP_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            data = {str(k): str(v) for k, v in raw.items() if v}
+    except Exception:
+        data = {}
+    if not data:
+        data = dict(DEFAULT_AUDIO_MAP)
+    _AUDIO_MAP_CACHE = dict(data)
+    return dict(_AUDIO_MAP_CACHE)
+
+def _preload_audio_assets() -> None:
+    audio_map = _load_audio_map(force=True)
+    ok_keys: List[str] = []
+    missing_keys: List[str] = []
+    empty_keys: List[str] = []
+    for key, path in audio_map.items():
+        if not path or not os.path.exists(path):
+            missing_keys.append(key)
+            continue
+        try:
+            if os.path.getsize(path) <= 0:
+                empty_keys.append(key)
+                continue
+        except Exception:
+            empty_keys.append(key)
+            continue
+        ok_keys.append(key)
+
+    _AUDIO_ASSETS_STATUS["ok_keys"] = ok_keys
+    _AUDIO_ASSETS_STATUS["missing_keys"] = missing_keys
+    _AUDIO_ASSETS_STATUS["empty_keys"] = empty_keys
+
+    try:
+        print(
+            f"AUDIO_ASSETS ok={len(ok_keys)} missing={missing_keys} empty={empty_keys}",
+            flush=True,
+        )
+    except Exception:
+        pass
+    try:
+        ws_broadcast(_ws_env("LOG_EVENT", "backend", {
+            "category": "audio",
+            "ok_keys": ok_keys,
+            "missing_keys": missing_keys,
+            "empty_keys": empty_keys,
+        }))
+    except Exception:
+        pass
+
+def _resolve_audio_path(name: str) -> Tuple[Optional[str], Optional[str]]:
+    if not name:
+        return None, "invalid_name"
+    audio_map = _load_audio_map()
+    path = audio_map.get(name)
+    if not path:
+        return None, "unknown_sound"
+    if not os.path.exists(path):
+        return path, "file_missing"
+    try:
+        if os.path.getsize(path) <= 0:
+            return path, "file_empty"
+    except Exception:
+        pass
+    return path, None
+
+def _resolve_audio_wav_path(name: str) -> Tuple[Optional[str], Optional[str]]:
+    if not name:
+        return None, "invalid_name"
+    path = os.path.join(AUDIO_WAV_DIR, f"{name}.wav")
+    if not os.path.exists(path):
+        return path, "file_missing"
+    try:
+        if os.path.getsize(path) <= 0:
+            return path, "file_empty"
+    except Exception:
+        return path, "file_empty"
+    return path, None
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=0.5)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+def _ensure_mixer_init() -> None:
+    global _MIXER_INIT_DONE
+    if _MIXER_INIT_DONE:
+        return
+    with _MIXER_INIT_LOCK:
+        if _MIXER_INIT_DONE:
+            return
+        script = "/opt/ndefender/system/wm8960_mixer_init.sh"
+        if os.path.exists(script) and os.access(script, os.X_OK):
+            try:
+                subprocess.run([script], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        _MIXER_INIT_DONE = True
+
+def _start_audio_proc(cmd: List[str]) -> Tuple[Optional[subprocess.Popen], Optional[str]]:
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return None, str(e)
+    return proc, None
+
+def _play_sound(sound_name: str, duration_ms: Optional[int] = None) -> Dict[str, Any]:
+    pw_play = shutil.which("pw-play")
+    path: Optional[str] = None
+    cmd: Optional[List[str]] = None
+
+    if pw_play:
+        wav_path, wav_err = _resolve_audio_wav_path(sound_name)
+        if wav_err or not wav_path:
+            return {"ok": False, "err": wav_err or "resolve_failed", "sound_name": sound_name, "file_path": wav_path, "exit_code": -1}
+        path = wav_path
+        if sound_name == "test_buzzer":
+            timeout_bin = shutil.which("timeout")
+            if not timeout_bin:
+                return {"ok": False, "err": "timeout_not_found", "sound_name": sound_name, "file_path": path, "exit_code": -1}
+            cmd = [timeout_bin, "4s", pw_play, path]
+        else:
+            cmd = [pw_play, path]
+    else:
+        path, err = _resolve_audio_path(sound_name)
+        if err or not path:
+            return {"ok": False, "err": err or "resolve_failed", "sound_name": sound_name, "file_path": path, "exit_code": -1}
+        if shutil.which("mpg123") is None:
+            return {"ok": False, "err": "mpg123_not_found", "sound_name": sound_name, "file_path": path, "exit_code": -1}
+        if sound_name == "test_buzzer":
+            timeout_bin = shutil.which("timeout")
+            if not timeout_bin:
+                return {"ok": False, "err": "timeout_not_found", "sound_name": sound_name, "file_path": path, "exit_code": -1}
+            cmd = [timeout_bin, "4s", "mpg123", "-q", "-a", AUDIO_ALSA_DEVICE, path]
+        else:
+            cmd = ["mpg123", "-q", "-a", AUDIO_ALSA_DEVICE, path]
+
+    try:
+        _ensure_mixer_init()
+        if not cmd or not path:
+            return {"ok": False, "err": "play_failed", "sound_name": sound_name, "file_path": path, "exit_code": -1}
+
+        with _AUDIO_PROC_LOCK:
+            global _AUDIO_PROC
+            if _AUDIO_PROC is not None:
+                _terminate_proc(_AUDIO_PROC)
+                _AUDIO_PROC = None
+            proc, start_err = _start_audio_proc(cmd)
+            if proc is None:
+                return {"ok": False, "err": start_err or "start_failed", "sound_name": sound_name, "file_path": path, "exit_code": -1}
+            _AUDIO_PROC = proc
+
+        exit_code = proc.wait()
+        with _AUDIO_PROC_LOCK:
+            if _AUDIO_PROC is proc:
+                _AUDIO_PROC = None
+
+        timed_out = sound_name == "test_buzzer" and exit_code == 124
+        ok = exit_code == 0 or timed_out
+        # Treat test_buzzer timeout as success for ACK exit_code consistency.
+        exit_code_for_ack = 0 if timed_out else exit_code
+        return {
+            "ok": ok,
+            "sound_name": sound_name,
+            "file_path": path,
+            "exit_code": int(exit_code_for_ack) if exit_code_for_ack is not None else None,
+            "timed_out": timed_out,
+            "duration_ms": duration_ms,
+        }
+    except Exception as e:
+        return {"ok": False, "err": str(e), "sound_name": sound_name, "file_path": path, "exit_code": -1}
+
+def _terminate_process(proc: subprocess.Popen, timeout_s: float) -> None:
+    try:
+        proc.wait(timeout=timeout_s)
+        return
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=0.5)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+def _start_speaker_test(duration_ms: int) -> Tuple[bool, Optional[str]]:
+    if shutil.which("speaker-test") is None:
+        return False, "speaker-test_not_found"
+    cmd = ["speaker-test", "-D", AUDIO_ALSA_DEVICE, "-c", "2", "-t", "sine", "-f", "1000", "-l", "1"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return False, str(e)
+    t = threading.Thread(target=_terminate_process, args=(proc, max(0.2, duration_ms / 1000.0)), daemon=True)
+    t.start()
+    return True, None
 
 # ---- Offline Map Packs ----
 _MAP_PACKS_LOCK = threading.Lock()
@@ -1805,6 +2049,65 @@ def _play_local_beep(duration_ms: int, freq_hz: int = 880, volume: float = 0.2) 
     except Exception:
         return False
 
+def _run_buzzer_test(duration_ms: int, req_id: Optional[str] = None, timeout_s: float = 2.0) -> Dict[str, Any]:
+    try:
+        duration_ms = int(duration_ms)
+    except Exception:
+        duration_ms = 1000
+    duration_ms = max(100, min(5000, duration_ms))
+
+    if not req_id:
+        req_id = f"buzz-{now_ms()}"
+
+    cmd_obj = {
+        "type": "cmd",
+        "proto": 1,
+        "req_id": req_id,
+        "cmd": "TEST_BEEP",
+        "ms": duration_ms,
+        "duration_ms": duration_ms,
+    }
+    try:
+        print(f"ESP32 buzzer_test send cmd=TEST_BEEP req_id={req_id} ms={duration_ms}", flush=True)
+    except Exception:
+        pass
+    res = esp32_send_cmd(cmd_obj, timeout_s=timeout_s)
+    try:
+        print(f"ESP32 buzzer_test ack req_id={req_id} ok={res.get('ok')} err={res.get('err')}", flush=True)
+    except Exception:
+        pass
+
+    ack = {
+        "target": "esp32",
+        "req_id": cmd_obj.get("req_id"),
+        "cmd": cmd_obj.get("cmd"),
+        "ok": bool(res.get("ok")),
+        "err": res.get("err"),
+    }
+    if isinstance(res.get("resp"), dict):
+        ack["resp"] = res["resp"]
+
+    ws_broadcast(_ws_env("COMMAND_ACK", "esp32", ack))
+
+    local_enabled = str(os.environ.get("NDEFENDER_LOCAL_BUZZER", "1")).lower() in ("1", "true", "yes", "on")
+    local_ok = _play_local_beep(duration_ms) if local_enabled else None
+
+    esp32_ok = bool(res.get("ok"))
+    ok = esp32_ok or bool(local_ok)
+    err = None if ok else (res.get("err") or "send_failed")
+
+    return {
+        "ok": ok,
+        "err": err,
+        "esp32_ok": esp32_ok,
+        "local_ok": local_ok,
+        "local_enabled": local_enabled,
+        "req_id": req_id,
+        "cmd": cmd_obj.get("cmd"),
+        "duration_ms": duration_ms,
+        "resp": res.get("resp") if isinstance(res.get("resp"), dict) else None,
+    }
+
 def _pick_strongest_vrx_id() -> Optional[int]:
     try:
         with _ctrl_lock:
@@ -2103,11 +2406,86 @@ def api_audio_volume_set():
         return jsonify({"ok": False, "error": "invalid_percent"}), 400
     if percent < 0 or percent > 100:
         return jsonify({"ok": False, "error": "invalid_percent"}), 400
-    ok, err = _set_volume_percent(percent)
+    ok, err, info, applied = _set_volume_percent(percent)
     if not ok:
-        return jsonify({"ok": False, "error": err or "set_failed"}), 500
+        return jsonify({"ok": False, "error": err or "set_failed", "controls": info, "applied_percent": applied}), 500
     actual, _ = _get_volume_percent()
-    return jsonify({"ok": True, "percent": actual if actual is not None else percent})
+    return jsonify({"ok": True, "percent": actual if actual is not None else applied, "controls": info, "applied_percent": applied})
+
+@app.post("/api/v1/audio/test_speaker")
+def api_audio_test_speaker():
+    payload = _json_body()
+    duration_ms = payload.get("duration_ms") or payload.get("ms") or 1000
+    try:
+        duration_ms = int(duration_ms)
+    except Exception:
+        duration_ms = 1000
+    duration_ms = max(200, min(2000, duration_ms))
+    ok, err = _start_speaker_test(duration_ms)
+    ack = {
+        "target": "audio",
+        "req_id": f"spk-{now_ms()}",
+        "cmd": "TEST_SPEAKER",
+        "ok": ok,
+        "err": err,
+        "duration_ms": duration_ms,
+        "device": AUDIO_ALSA_DEVICE,
+    }
+    ws_broadcast(_ws_env("COMMAND_ACK", "backend", ack))
+    if not ok:
+        return jsonify({"ok": False, "error": err or "start_failed"}), 500
+    return jsonify({"ok": True, "duration_ms": duration_ms, "device": AUDIO_ALSA_DEVICE})
+
+@app.post("/api/v1/audio/play")
+def api_audio_play():
+    payload = _json_body()
+    name = str(payload.get("name") or "").strip()
+    duration_ms = payload.get("duration_ms")
+    result = _play_sound(name, duration_ms=duration_ms)
+    ack = {
+        "target": "audio",
+        "req_id": payload.get("req_id") or f"snd-{now_ms()}",
+        "cmd": "PLAY_SOUND",
+        "ok": bool(result.get("ok")),
+        "sound_name": name,
+        "file_path": result.get("file_path"),
+    }
+    if not result.get("ok"):
+        ack["err"] = result.get("err")
+        ack["exit_code"] = result.get("exit_code")
+        ack["timed_out"] = result.get("timed_out")
+        ws_broadcast(_ws_env("COMMAND_ACK", "backend", ack))
+        return jsonify({"ok": False, "error": result.get("err") or "play_failed"}), 500
+    ack["exit_code"] = result.get("exit_code")
+    ack["timed_out"] = result.get("timed_out")
+    ws_broadcast(_ws_env("COMMAND_ACK", "backend", ack))
+    return jsonify({"ok": True, "sound_name": name, "file_path": result.get("file_path"), "exit_code": result.get("exit_code"), "timed_out": result.get("timed_out")})
+
+@app.get("/api/v1/audio/asset/<name>")
+def api_audio_asset(name: str):
+    sound = str(name or "").strip()
+    path, err = _resolve_audio_path(sound)
+    if err or not path:
+        return jsonify({"ok": False, "error": err or "not_found"}), 404
+    try:
+        if os.path.getsize(path) <= 0:
+            return jsonify({"ok": False, "error": "file_empty"}), 404
+    except Exception:
+        return jsonify({"ok": False, "error": "stat_failed"}), 404
+    return send_file(path, mimetype="audio/mpeg", conditional=True)
+
+@app.get("/api/v1/audio/asset_wav/<name>")
+def api_audio_asset_wav(name: str):
+    sound = str(name or "").strip()
+    path, err = _resolve_audio_wav_path(sound)
+    if err or not path:
+        return jsonify({"ok": False, "error": err or "not_found"}), 404
+    try:
+        if os.path.getsize(path) <= 0:
+            return jsonify({"ok": False, "error": "file_empty"}), 404
+    except Exception:
+        return jsonify({"ok": False, "error": "stat_failed"}), 404
+    return send_file(path, mimetype="audio/wav", conditional=True)
 
 @app.route("/api/v1/settings/maps", methods=["PUT"])
 def api_settings_maps():
@@ -2168,50 +2546,17 @@ def api_buzzer_test():
 def api_esp32_buzzer_test():
     payload = _json_body()
     duration_ms = payload.get("duration_ms") or payload.get("ms") or 1000
-    try:
-        duration_ms = int(duration_ms)
-    except Exception:
-        duration_ms = 1000
-    duration_ms = max(100, min(5000, duration_ms))
-
-    req_id = f"buzz-{now_ms()}"
-    cmd_obj = {
-        "type": "cmd",
-        "proto": 1,
-        "req_id": req_id,
-        "cmd": "TEST_BEEP",
-        "ms": duration_ms,
-        "duration_ms": duration_ms,
-    }
-    try:
-        print(f"ESP32 buzzer_test send cmd=TEST_BEEP req_id={req_id} ms={duration_ms}", flush=True)
-    except Exception:
-        pass
-    res = esp32_send_cmd(cmd_obj, timeout_s=2.0)
-    try:
-        print(f"ESP32 buzzer_test ack req_id={req_id} ok={res.get('ok')} err={res.get('err')}", flush=True)
-    except Exception:
-        pass
-
-    ack = {
-        "target": "esp32",
-        "req_id": cmd_obj.get("req_id"),
-        "cmd": cmd_obj.get("cmd"),
-        "ok": bool(res.get("ok")),
-        "err": res.get("err"),
-    }
-    if isinstance(res.get("resp"), dict):
-        ack["resp"] = res["resp"]
-
-    ws_broadcast(_ws_env("COMMAND_ACK", "esp32", ack))
-
-    local_enabled = str(os.environ.get("NDEFENDER_LOCAL_BUZZER", "1")).lower() in ("1", "true", "yes", "on")
-    local_ok = _play_local_beep(duration_ms) if local_enabled else None
-
-    esp32_ok = bool(res.get("ok"))
-    if not esp32_ok and not local_ok:
-        return jsonify({"ok": False, "error": res.get("err") or "send_failed"}), 500
-    return jsonify({"ok": True, "esp32_ok": esp32_ok, "local_ok": local_ok, "local_enabled": local_enabled})
+    result = _run_buzzer_test(duration_ms, timeout_s=2.0)
+    if not result.get("ok"):
+        return jsonify({"ok": False, "error": result.get("err") or "send_failed"}), 500
+    return jsonify({
+        "ok": True,
+        "esp32_ok": result.get("esp32_ok"),
+        "local_ok": result.get("local_ok"),
+        "local_enabled": result.get("local_enabled"),
+        "duration_ms": result.get("duration_ms"),
+        "req_id": result.get("req_id"),
+    })
 
 @app.route("/api/v1/maps/packs/download", methods=["POST"])
 def api_maps_pack_download():
@@ -2528,57 +2873,143 @@ def ws_session_v1(ws):
             # COMMAND bridge
             if isinstance(obj, dict) and str(obj.get("type") or "").upper() == "COMMAND":
                 data = obj.get("data") or {}
-                if isinstance(data, dict) and str(data.get("target") or "").lower() == "esp32":
+                if isinstance(data, dict):
                     req_id = data.get("req_id") or data.get("id") or f"t{now_ms()}"
                     cmd = data.get("cmd") or data.get("command")
                     orig_cmd = cmd
                     cmd_norm = str(cmd or "").upper()
-                    args = data.get("args") if isinstance(data.get("args"), dict) else {}
+                    target = str(data.get("target") or "").lower()
 
-                    cmd_obj = {"type":"cmd","proto":1,"req_id":req_id,"cmd":cmd}
+                    if cmd_norm in ("SET_VOLUME", "TEST_SPEAKER", "TEST_BUZZER", "PLAY_SOUND") and target != "esp32":
+                        ack: Dict[str, Any] = {
+                            "target": "audio" if cmd_norm in ("SET_VOLUME", "TEST_SPEAKER", "PLAY_SOUND") else "buzzer",
+                            "req_id": req_id,
+                            "cmd": cmd_norm,
+                            "ok": False,
+                        }
+                        if cmd_norm == "SET_VOLUME":
+                            value = _get_any(data, ["value", "percent", "volume", "level"])
+                            v = _clamp_int(value, 0, 100)
+                            if v is None:
+                                ack["err"] = "invalid_value"
+                            else:
+                                ok, err, info, applied = _set_volume_percent(v)
+                                actual, _ = _get_volume_percent()
+                                ack.update({
+                                    "ok": ok,
+                                    "err": err,
+                                    "value": v,
+                                    "percent": actual if actual is not None else applied,
+                                    "applied_percent": applied,
+                                    "backend": info.get("backend") if isinstance(info, dict) else _detect_audio_backend(),
+                                    "alsa_card": info.get("alsa_card") if isinstance(info, dict) else AUDIO_ALSA_CARD,
+                                    "alsa_control": "Playback",
+                                    "alsa_controls": info if isinstance(info, dict) else {"playback_control": "Playback", "speaker_control": "Speaker"},
+                                })
+                        elif cmd_norm == "TEST_SPEAKER":
+                            duration_ms = data.get("duration_ms") or data.get("ms") or 1000
+                            try:
+                                duration_ms = int(duration_ms)
+                            except Exception:
+                                duration_ms = 1000
+                            duration_ms = max(200, min(2000, duration_ms))
+                            ok, err = _start_speaker_test(duration_ms)
+                            ack.update({
+                                "ok": ok,
+                                "err": err,
+                                "duration_ms": duration_ms,
+                                "device": AUDIO_ALSA_DEVICE,
+                            })
+                        elif cmd_norm == "TEST_BUZZER":
+                            duration_ms = data.get("duration_ms") or data.get("ms") or 1000
+                            timeout_s = float(data.get("timeout_s") or 2.0)
+                            result = _run_buzzer_test(duration_ms, req_id=req_id, timeout_s=timeout_s)
+                            ack.update({
+                                "ok": result.get("ok"),
+                                "err": result.get("err"),
+                                "duration_ms": result.get("duration_ms"),
+                                "esp32_ok": result.get("esp32_ok"),
+                                "local_ok": result.get("local_ok"),
+                                "local_enabled": result.get("local_enabled"),
+                            })
+                            if isinstance(result.get("resp"), dict):
+                                ack["resp"] = result["resp"]
+                        elif cmd_norm == "PLAY_SOUND":
+                            name = str(data.get("name") or data.get("sound") or "").strip()
+                            duration_ms = data.get("duration_ms")
+                            result = _play_sound(name, duration_ms=duration_ms)
+                            ack.update({
+                                "ok": result.get("ok"),
+                                "err": result.get("err"),
+                                "sound_name": name,
+                                "file_path": result.get("file_path"),
+                                "exit_code": result.get("exit_code"),
+                                "timed_out": result.get("timed_out"),
+                            })
+                            app.logger.info(
+                                "PLAY_SOUND req_id=%s sound_name=%s exit_code=%s timed_out=%s ok=%s",
+                                req_id,
+                                name,
+                                result.get("exit_code"),
+                                result.get("timed_out"),
+                                result.get("ok"),
+                            )
+                            print(
+                                f"PLAY_SOUND req_id={req_id} sound_name={name} "
+                                f"exit_code={result.get('exit_code')} timed_out={result.get('timed_out')} ok={result.get('ok')}",
+                                flush=True,
+                            )
 
-                    # flatten args into top-level (controller expects flat fields)
-                    for k, v in (args or {}).items():
-                        cmd_obj[k] = v
+                        ws.send(json.dumps(_ws_env("COMMAND_ACK", "backend", ack), separators=(",",":")))
+                        continue
 
-                    # also accept flat fields inside data
-                    for k, v in data.items():
-                        if k in ("target","req_id","id","cmd","command","args","timeout_s"):
-                            continue
-                        cmd_obj[k] = v
+                    if target == "esp32":
+                        args = data.get("args") if isinstance(data.get("args"), dict) else {}
 
-                    # Command aliases for controller firmware compatibility
-                    if cmd_norm == "FPV_SCAN_STOP":
-                        cmd_obj["cmd"] = "FPV_HOLD_SET"
-                        cmd_obj["hold"] = 1
-                    elif cmd_norm == "FPV_LOCK_STRONGEST":
-                        sel = _pick_strongest_vrx_id()
-                        if sel is None:
-                            ack = {
-                                "target": "esp32",
-                                "req_id": req_id,
-                                "cmd": orig_cmd,
-                                "ok": False,
-                                "err": "no_vrx",
-                            }
-                            ws.send(json.dumps(_ws_env("COMMAND_ACK", "backend", ack), separators=(",",":")))
-                            continue
-                        cmd_obj["cmd"] = "VIDEO_SELECT"
-                        cmd_obj["sel"] = int(sel)
+                        cmd_obj = {"type":"cmd","proto":1,"req_id":req_id,"cmd":cmd}
 
-                    res = esp32_send_cmd(cmd_obj, timeout_s=float(data.get("timeout_s") or 1.5))
-                    ack = {
-                        "target": "esp32",
-                        "req_id": req_id,
-                        "cmd": orig_cmd,
-                        "ok": bool(res.get("ok")),
-                        "err": res.get("err"),
-                    }
-                    if isinstance(res.get("resp"), dict):
-                        ack["resp"] = res["resp"]
+                        # flatten args into top-level (controller expects flat fields)
+                        for k, v in (args or {}).items():
+                            cmd_obj[k] = v
 
-                    ws.send(json.dumps(_ws_env("COMMAND_ACK", "backend", ack), separators=(",",":")))
-                    continue
+                        # also accept flat fields inside data
+                        for k, v in data.items():
+                            if k in ("target","req_id","id","cmd","command","args","timeout_s"):
+                                continue
+                            cmd_obj[k] = v
+
+                        # Command aliases for controller firmware compatibility
+                        if cmd_norm == "FPV_SCAN_STOP":
+                            cmd_obj["cmd"] = "FPV_HOLD_SET"
+                            cmd_obj["hold"] = 1
+                        elif cmd_norm == "FPV_LOCK_STRONGEST":
+                            sel = _pick_strongest_vrx_id()
+                            if sel is None:
+                                ack = {
+                                    "target": "esp32",
+                                    "req_id": req_id,
+                                    "cmd": orig_cmd,
+                                    "ok": False,
+                                    "err": "no_vrx",
+                                }
+                                ws.send(json.dumps(_ws_env("COMMAND_ACK", "backend", ack), separators=(",",":")))
+                                continue
+                            cmd_obj["cmd"] = "VIDEO_SELECT"
+                            cmd_obj["sel"] = int(sel)
+
+                        res = esp32_send_cmd(cmd_obj, timeout_s=float(data.get("timeout_s") or 1.5))
+                        ack = {
+                            "target": "esp32",
+                            "req_id": req_id,
+                            "cmd": orig_cmd,
+                            "ok": bool(res.get("ok")),
+                            "err": res.get("err"),
+                        }
+                        if isinstance(res.get("resp"), dict):
+                            ack["resp"] = res["resp"]
+
+                        ws.send(json.dumps(_ws_env("COMMAND_ACK", "backend", ack), separators=(",",":")))
+                        continue
 
             # default: keep tool ACK behavior
             ws.send(json.dumps(_ws_env("COMMAND_ACK", "backend", {"ok": True}), separators=(",",":")))
@@ -2609,6 +3040,7 @@ def main():
     tracker = ContactTracker(ttl_s=RID_TTL_S)
     global _TRACKER
     _TRACKER = tracker
+    _preload_audio_assets()
 
     if REMOTEID_MODE in ("live", "replay"):
         threading.Thread(target=remoteid_live_worker, args=(tracker,), daemon=True).start()

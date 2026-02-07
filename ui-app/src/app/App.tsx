@@ -1,4 +1,4 @@
-import { useEffect, useState, Component, type ReactNode } from 'react';
+import { useEffect, useState, useRef, Component, type ReactNode } from 'react';
 import { StatusBar } from './components/StatusBar';
 import { StatusDrawer } from './components/StatusDrawer';
 import { PanicControls } from './components/PanicControls';
@@ -13,6 +13,7 @@ import { Esp32DebugPanel } from './components/dev/Esp32DebugPanel';
 import { fetchStatusSnapshot } from './services/status';
 import { webSocketService } from './services/websocket';
 import { sendEsp32Command } from './services/esp32Commands';
+import { playSound, preloadAudioAssets, resumeAudio } from './services/audioCommands';
 import type { Contact } from './types/contacts';
 
 type SettingsErrorBoundaryProps = {
@@ -271,6 +272,8 @@ export default function App() {
   const [statusSnapshot, setStatusSnapshot] = useState<any | null>(null);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const startupSoundPlayedRef = useRef(false);
+  const lastDroneAlarmTsRef = useRef(0);
 
   // TEMP TEST: Inject one FPV contact so controller command buttons can be validated.
   // Remove after FPV_LINK contacts are generated from real telemetry.
@@ -307,7 +310,90 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    let retryTimer: number | null = null;
+    const attempt = () => {
+      preloadAudioAssets()
+        .then((ok) => {
+          if (!active) return;
+          if (ok) {
+            setAudioReady(true);
+            return;
+          }
+          setAudioReady(false);
+          retryTimer = window.setTimeout(attempt, 1500);
+        })
+        .catch(() => {
+          if (!active) return;
+          setAudioReady(false);
+          retryTimer = window.setTimeout(attempt, 1500);
+        });
+    };
+    attempt();
+    return () => {
+      active = false;
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handler = () => {
+      resumeAudio();
+    };
+    document.addEventListener('pointerdown', handler, { capture: true, once: true });
+    return () => {
+      document.removeEventListener('pointerdown', handler, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handler = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      const button = target?.closest?.('button');
+      if (!button) return;
+      if (button.getAttribute('data-ui-sound') === '1') return;
+      if ((button as HTMLButtonElement).disabled) return;
+      if (button.getAttribute('aria-disabled') === 'true') return;
+      playSound('ui_click');
+    };
+    document.addEventListener('click', handler, true);
+    return () => document.removeEventListener('click', handler, true);
+  }, []);
+
   const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [audioReady, setAudioReady] = useState<boolean>(false);
+  const showLoading = !audioReady || !wsConnected;
+
+  useEffect(() => {
+    const existing = document.getElementById('audio-loading-overlay') as HTMLDivElement | null;
+    if (!showLoading) {
+      if (existing) existing.remove();
+      return;
+    }
+
+    const overlay = existing || document.createElement('div');
+    overlay.id = 'audio-loading-overlay';
+    overlay.style.position = 'fixed';
+    overlay.style.inset = '0';
+    overlay.style.background = 'rgba(5, 10, 20, 0.92)';
+    overlay.style.color = '#e2e8f0';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '9999';
+    overlay.style.pointerEvents = 'auto';
+    overlay.style.fontFamily = 'system-ui, -apple-system, Segoe UI, sans-serif';
+    overlay.innerHTML = '<div style=\"text-align:center;\"><div style=\"font-size:18px;font-weight:600;\">Loading audio...</div><div style=\"margin-top:6px;font-size:12px;color:#94a3b8;\">Preparing speaker + WebSocket</div></div>';
+
+    if (!existing) {
+      document.body.appendChild(overlay);
+    }
+
+    return () => {
+      if (overlay.parentElement) overlay.remove();
+    };
+  }, [showLoading]);
   const devEnabled = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('dev') === '1';
 
   const system = statusSnapshot?.system ?? {};
@@ -413,6 +499,10 @@ export default function App() {
   useEffect(() => {
     const onConnected = () => {
       setWsConnected(true);
+      if (!startupSoundPlayedRef.current) {
+        startupSoundPlayedRef.current = true;
+        playSound('startup_bg');
+      }
       // refresh status right after connect
       fetchStatusSnapshot()
         .then((snap) => setStatusSnapshot(snap))
@@ -443,6 +533,14 @@ export default function App() {
     const handleContactEvent = (incoming: any, envelope?: any) => {
       const ui = mapIncomingContact(incoming, envelope);
       if (!ui) return;
+
+      if (envelope?.type === 'CONTACT_NEW' && (ui.type === 'REMOTE_ID' || ui.type === 'FPV_LINK')) {
+        const now = Date.now();
+        if (now - lastDroneAlarmTsRef.current > 3000) {
+          lastDroneAlarmTsRef.current = now;
+          playSound('drone_detected_alarm');
+        }
+      }
 
       if (envelope?.type === 'CONTACT_LOST') {
         setContacts((prev: any[]) => prev.filter((c) => c.id !== ui.id));

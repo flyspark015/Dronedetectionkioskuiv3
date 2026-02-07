@@ -12,9 +12,9 @@ import {
   buzzerTest,
   videoCaptureToggle,
   getSystemVolume,
-  setSystemVolume,
   getPmtilesPacks,
 } from '@/app/services/settings';
+import { playSound, sendVolumeCommand } from '@/app/services/audioCommands';
 
 interface SettingsScreenProps {
   hasCriticalAlert?: boolean;
@@ -135,6 +135,7 @@ export function SettingsScreen({
   onOpenDevPanel,
 }: SettingsScreenProps) {
   const [audioVolume, setAudioVolume] = useState(80);
+  const [speakerBusy, setSpeakerBusy] = useState(false);
   const [buzzerBusy, setBuzzerBusy] = useState(false);
   const [alertPreset, setAlertPreset] = useState<'Balanced' | 'Critical Focus' | 'Training'>('Balanced');
   const [showRfSettings, setShowRfSettings] = useState(false);
@@ -244,9 +245,19 @@ export function SettingsScreen({
     if (buzzerBusy) return;
     setBuzzerBusy(true);
     setAudioSaveState('saving');
+    playSound('test_buzzer');
     const res = await buzzerTest();
     setAudioSaveState(res.ok ? 'saved' : (res.error === 'not supported in this build' ? 'unsupported' : 'error'));
     setBuzzerBusy(false);
+  };
+
+  const handleSpeakerTest = async () => {
+    if (speakerBusy) return;
+    setSpeakerBusy(true);
+    setAudioSaveState('saving');
+    playSound('startup_bg');
+    setAudioSaveState('saved');
+    setSpeakerBusy(false);
   };
 
   const controllerConnected = String(esp32?.status ?? '').toLowerCase() === 'connected';
@@ -303,8 +314,8 @@ export function SettingsScreen({
     audioPendingRef.current = true;
     setAudioSaveState('saving');
     const targetVolume = payload.volume ?? audioVolume;
-    const res = await setSystemVolume(targetVolume);
-    setAudioSaveState(res.ok ? 'saved' : (res.error === 'not supported in this build' ? 'unsupported' : 'error'));
+    const res = await sendVolumeCommand(targetVolume);
+    setAudioSaveState(res.ok ? 'saved' : (res.err === 'ws_disconnected' ? 'unsupported' : 'error'));
     audioPendingRef.current = false;
     if (audioQueuedRef.current) {
       const next = audioQueuedRef.current;
@@ -378,8 +389,11 @@ export function SettingsScreen({
               />
             </div>
 
-            {/* Buzzer Test */}
-            <div className="pt-3 border-t border-slate-700">
+            {/* Speaker + Buzzer Tests */}
+            <div className="pt-3 border-t border-slate-700 space-y-2">
+              <Button size="md" variant="secondary" onClick={handleSpeakerTest} fullWidth disabled={speakerBusy}>
+                {speakerBusy ? 'Testing…' : 'Test Speaker'}
+              </Button>
               <Button size="md" variant="secondary" onClick={handleBuzzerTest} fullWidth disabled={buzzerBusy}>
                 {buzzerBusy ? 'Testing…' : 'Test Buzzer'}
               </Button>

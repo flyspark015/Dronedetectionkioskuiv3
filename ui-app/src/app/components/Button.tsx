@@ -1,3 +1,5 @@
+import { playSound } from '@/app/services/audioCommands';
+
 interface ButtonProps {
   children: React.ReactNode;
   variant?: 'primary' | 'secondary' | 'danger' | 'warning';
@@ -34,12 +36,19 @@ export function Button({
 
   const widthClasses = fullWidth ? 'w-full' : '';
 
+  const handleClick = () => {
+    if (disabled) return;
+    playSound('ui_click');
+    onClick?.();
+  };
+
   return (
     <button
       type="button"
       className={`${baseClasses} ${sizeClasses[size]} ${variantClasses[variant]} ${widthClasses}`}
-      onClick={onClick}
+      onClick={handleClick}
       disabled={disabled}
+      data-ui-sound="1"
     >
       {icon && <span className="flex-shrink-0">{icon}</span>}
       <span>{children}</span>

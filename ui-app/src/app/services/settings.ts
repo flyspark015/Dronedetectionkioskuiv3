@@ -54,7 +54,7 @@ export function rebootDevice(dryRun = true) {
 }
 
 export function buzzerTest() {
-  return requestJson('/api/v1/esp32/buzzer_test', { method: 'POST', body: JSON.stringify({ duration_ms: 1000 }) });
+  return requestJson('/api/v1/esp32/buzzer_test', { method: 'POST', body: JSON.stringify({ duration_ms: 200 }) });
 }
 
 export function getMapPacks() {

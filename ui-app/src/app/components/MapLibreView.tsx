@@ -36,37 +36,15 @@ const extractVectorLayers = (metadata: any): string[] => {
 };
 
 const buildVectorLayers = (vectorLayers?: string[] | null) => {
-  const layers = Array.isArray(vectorLayers) ? vectorLayers : [];
-  const styleLayers: any[] = [];
-
-  for (const layer of layers) {
-    styleLayers.push({
-      id: `fill-${layer}`,
-      type: 'fill',
-      source: 'pm',
-      'source-layer': layer,
-      filter: ['==', '$type', 'Polygon'],
-      paint: { 'fill-color': '#1f2937', 'fill-opacity': 0.55 },
-    });
-    styleLayers.push({
-      id: `line-${layer}`,
-      type: 'line',
-      source: 'pm',
-      'source-layer': layer,
-      filter: ['==', '$type', 'LineString'],
-      paint: { 'line-color': '#94a3b8', 'line-width': 1.1 },
-    });
-    styleLayers.push({
-      id: `point-${layer}`,
-      type: 'circle',
-      source: 'pm',
-      'source-layer': layer,
-      filter: ['==', '$type', 'Point'],
-      paint: { 'circle-color': '#e2e8f0', 'circle-radius': 2 },
-    });
-  }
-
-  return styleLayers;
+  const layers = Array.isArray(vectorLayers) ? vectorLayers.slice(0, 12) : [];
+  return layers.map((layer) => ({
+    id: `line-${layer}`,
+    type: 'line',
+    source: 'pm',
+    'source-layer': layer,
+    filter: ['any', ['==', '$type', 'LineString'], ['==', '$type', 'Polygon']],
+    paint: { 'line-color': '#ffffff', 'line-width': 1 },
+  }));
 };
 
 const buildRasterLayer = () => ({
@@ -184,6 +162,7 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
   const styleSetCountRef = useRef(0);
   const workerReadyRef = useRef(false);
   const workerWarnedRef = useRef(false);
+  const markerAddedRef = useRef(false);
   const initialViewRef = useRef<{ center: [number, number]; zoom: number; maxZoom: number } | null>(null);
   const packInitRef = useRef(false);
   const debugInfoRef = useRef({ ...INITIAL_DEBUG_INFO });
@@ -410,6 +389,7 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
         if (cancelled) return;
         const layers = extractVectorLayers(metadata);
         setPackLayers(layers);
+        console.log('[MapLibre] pack:layer_names', layers);
         guardLog('pack:layers', { count: layers.length });
         window.setTimeout(queueDebugPublish, 0);
       })
@@ -506,6 +486,9 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
       : buildVectorLayers(packLayers);
     const finalStyle = buildStyle(sourceSpec, layerDefs);
 
+    console.log('[MapLibre] style:sources', Object.keys((finalStyle as any).sources || {}));
+    console.log('[MapLibre] style:layers', ((finalStyle as any).layers || []).length);
+
     guardLog('init:create', { center, zoom, maxZoom, packId });
     try {
       const map = new libs.maplibregl.Map({
@@ -518,6 +501,13 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
         interactive: true,
       });
       mapRef.current = map;
+      map.on('error', (e: any) => console.error('[MapLibre] map:error', e?.error || e));
+      map.on('styledata', () => console.log('[MapLibre] evt:styledata'));
+      map.on('sourcedata', (e: any) => {
+        if (e?.sourceId) console.log('[MapLibre] evt:sourcedata', e.sourceId, e.isSourceLoaded);
+      });
+      map.on('load', () => console.log('[MapLibre] evt:load'));
+      map.on('idle', () => console.log('[MapLibre] evt:idle'));
       initialViewRef.current = { center, zoom, maxZoom };
       const canvas = map.getCanvas();
       updateDebug({
@@ -584,6 +574,17 @@ export function MapLibreView({ gpsFixQuality, gpsLatitude, gpsLongitude, online 
         if (map.isSourceLoaded('pm')) {
           sourceLoadedRef.current = true;
           updateDebug({ sourceLoaded: true });
+        }
+        try {
+          map.fitBounds([[58, 0], [106, 40]], { padding: 20, duration: 0, maxZoom: 6 });
+        } catch {}
+        if (!markerAddedRef.current) {
+          markerAddedRef.current = true;
+          try {
+            new libs.maplibregl.Marker({ color: '#ff0000' })
+              .setLngLat([77.1025, 28.7041])
+              .addTo(map);
+          } catch {}
         }
         if (!firstFrameKickRef.current) {
           firstFrameKickRef.current = true;

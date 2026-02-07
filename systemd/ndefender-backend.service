@@ -1,0 +1,28 @@
+[Unit]
+Description=N-Defender Backend (Flask + WebSocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=toybook
+Group=toybook
+WorkingDirectory=/opt/ndefender/backend
+ExecStart=/opt/ndefender/backend/venv/bin/python -u /opt/ndefender/backend/app.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+Environment=NDEFENDER_REMOTEID_MODE=live
+Environment=NDEFENDER_REMOTEID_LIVE_JSONL=/opt/ndefender/logs/remoteid_decoded.jsonl
+Environment=NDEFENDER_REMOTEID_REPLAY_JSONL=/opt/ndefender/logs/remoteid_replay.jsonl
+Environment=NDEFENDER_REMOTEID_REPLAY_FILE=/opt/ndefender/remoteid/testdata/odid_wifi_sample.pcap
+Environment=NDEFENDER_REMOTEID_REPLAY_LOOP=1
+Environment=NDEFENDER_REMOTEID_REPLAY_INTERVAL=0.2
+Environment=NDEFENDER_REMOTEID_SERVICE=ndefender-remoteid-live
+Environment=NDEFENDER_REPLAY_LOOP=1
+Environment=NDEFENDER_CTRL_DEV=/dev/ndefender-esp32
+Environment=NDEFENDER_PMTILES_INDIA_URL=https://cdn.jsdelivr.net/npm/@india-boundary-corrector/data@0.2.1/india_boundary_corrections.pmtiles
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=multi-user.target

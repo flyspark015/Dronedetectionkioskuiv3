@@ -1,0 +1,6 @@
+{
+  "ui_click": "/opt/ndefender/assets/audio/ui_click.mp3",
+  "startup_bg": "/opt/ndefender/assets/audio/startup_bg.mp3",
+  "drone_detected_alarm": "/opt/ndefender/assets/audio/drone_detected_alarm.mp3",
+  "test_buzzer": "/opt/ndefender/assets/audio/test_buzzer.mp3"
+}

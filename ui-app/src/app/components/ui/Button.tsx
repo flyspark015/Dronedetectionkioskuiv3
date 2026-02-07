@@ -1,4 +1,5 @@
 import { ButtonHTMLAttributes, ReactNode, useRef, MouseEvent } from 'react';
+import { playSound } from '@/app/services/audioCommands';
 
 /**
  * Touch-First Button Component
@@ -78,6 +79,7 @@ export function Button({
   const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
     if (!disabled && !isLoading) {
       createRipple(event);
+      playSound('ui_click');
       onClick?.(event);
     }
   };
@@ -150,6 +152,7 @@ export function Button({
       `.trim().replace(/\s+/g, ' ')}
       disabled={disabled || isLoading}
       onClick={handleClick}
+      data-ui-sound="1"
       {...props}
     >
       {isLoading ? (
@@ -236,6 +239,7 @@ export function IconButton({
   const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
     if (!disabled) {
       createRipple(event);
+      playSound('ui_click');
       onClick?.(event);
     }
   };
@@ -284,6 +288,7 @@ export function IconButton({
       `.trim().replace(/\s+/g, ' ')}
       disabled={disabled}
       onClick={handleClick}
+      data-ui-sound="1"
       aria-label={label}
       {...props}
     >

@@ -1,0 +1,10 @@
+[Unit]
+Description=WM8960 mixer init (routing + volume)
+After=sound.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ndefender/system/wm8960_mixer_init.sh
+
+[Install]
+WantedBy=multi-user.target
